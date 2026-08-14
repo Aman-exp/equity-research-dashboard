@@ -13,20 +13,75 @@
 -- ============================================================================
 
 -- ----------------------------------------------------------------------------
+-- Split/bonus-adjusted prices, computed at query time. Raw price_history is
+-- never rewritten — it stays as reported, for reconciling against contract notes.
+-- Charts and any multi-year comparison must read close_adjusted.
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW v_price_adjusted WITH (security_invoker = true) AS
+SELECT
+  ph.isin,
+  ph.date,
+  ph.close                                  AS close_raw,
+  ph.close / adj_factor(ph.isin, ph.date)   AS close_adjusted,
+  ph.volume
+FROM price_history ph;
+
+-- ----------------------------------------------------------------------------
 -- Holdings — DERIVED, never a table.
--- avg_cost here is a display convenience computed on read (buy-side cost incl.
--- charges). It is NOT a stored cost basis and must never be persisted: FIFO tax
--- computation in Phase 3 consumes the underlying lots from `transactions`.
+--
+-- Quantities are multiplied by adj_factor() so a split or bonus is reflected
+-- without inventing transaction rows. `transactions` stays an immutable record
+-- of what was actually done; the corporate action is applied on read.
+--
+-- Cost is NOT adjusted: a split or bonus changes the share count, never the
+-- total rupees paid. avg_cost therefore falls automatically as quantity rises,
+-- which is the correct arithmetic.
+--
+-- avg_cost is a display convenience and NOT a tax basis. Phase 3's FIFO work
+-- needs true lot-level treatment, which this view intentionally does not model:
+-- under Indian tax law a BONUS creates a separate lot with ZERO cost of
+-- acquisition dated at allotment, whereas a SPLIT rescales the original lot and
+-- preserves its acquisition date. Both give the same totals here, but different
+-- lots — so do not build LTCG/STCG on this view.
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE VIEW v_holdings WITH (security_invoker = true) AS
 SELECT
   t.isin,
-  sum(CASE WHEN t.txn_type = 'buy' THEN t.quantity ELSE -t.quantity END) AS quantity,
+  sum(CASE WHEN t.txn_type = 'buy' THEN t.quantity ELSE -t.quantity END
+      * adj_factor(t.isin, t.txn_date))                                    AS quantity,
   sum(CASE WHEN t.txn_type = 'buy' THEN t.quantity * t.price + t.charges ELSE 0 END)
-    / NULLIF(sum(CASE WHEN t.txn_type = 'buy' THEN t.quantity ELSE 0 END), 0)  AS avg_cost
+    / NULLIF(sum(CASE WHEN t.txn_type = 'buy'
+                      THEN t.quantity * adj_factor(t.isin, t.txn_date) ELSE 0 END), 0)
+                                                                           AS avg_cost
 FROM transactions t
 GROUP BY t.isin
-HAVING sum(CASE WHEN t.txn_type = 'buy' THEN t.quantity ELSE -t.quantity END) > 0;
+HAVING sum(CASE WHEN t.txn_type = 'buy' THEN t.quantity ELSE -t.quantity END
+           * adj_factor(t.isin, t.txn_date)) > 0;
+
+-- ----------------------------------------------------------------------------
+-- Unconfirmed corporate actions affecting something you actually hold.
+--
+-- adj_factor() applies ONLY confirmed actions, because a mis-parsed auto-ingested
+-- action would silently corrupt every quantity and price. The cost of that
+-- caution is that an unconfirmed-but-real bonus leaves holdings understated — so
+-- the dashboard MUST surface this view as a blocking banner rather than quietly
+-- showing a number that is probably wrong.
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW v_pending_corporate_actions WITH (security_invoker = true) AS
+SELECT
+  ca.isin,
+  c.company_name,
+  ca.action_type,
+  ca.ratio_from,
+  ca.ratio_to,
+  ca.ex_date,
+  ca.entry_mode,
+  ca_factor(ca.action_type, ca.ratio_from, ca.ratio_to) AS would_apply_factor,
+  EXISTS (SELECT 1 FROM transactions t WHERE t.isin = ca.isin) AS affects_a_position
+FROM corporate_actions ca
+JOIN companies c ON c.isin = ca.isin
+WHERE ca.status = 'unverified'
+ORDER BY ca.ex_date DESC;
 
 -- ----------------------------------------------------------------------------
 -- Portfolio summary: current value and unrealised P&L per holding.
@@ -133,18 +188,25 @@ JOIN LATERAL (
 -- transactions — NOT current quantities applied across all history, which would
 -- silently backtest today's portfolio instead of showing actual realised return.
 --
--- Raw (unadjusted) prices are correct here: before a split, both the historical
--- quantity and the historical price are in pre-split terms, so value is
--- self-consistent at each date. This holds only while the split/bonus quantity
--- gap noted in 001_phase0_schema.sql remains unresolved in one direction — once
--- corporate_actions lands in Phase 1, revisit this view together with it.
+-- CORRECTION to an earlier draft's comment, which claimed raw prices were safe
+-- here because pre-split quantities pair with pre-split prices. That is only true
+-- BEFORE the split. After it, the running quantity is still in pre-split units
+-- while prices have become post-split, understating the portfolio by the split
+-- factor from that day onward.
+--
+-- The fix: carry quantities in CURRENT-equivalent units (multiply by
+-- adj_factor at the transaction date) and value them against ADJUSTED prices.
+-- The two factors cancel exactly, so each date's value is correct in the units
+-- prevailing then:
+--     qty_at_d x raw_price_d  ==  current_equiv_qty x adjusted_price_d
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE VIEW v_benchmark_comparison WITH (security_invoker = true) AS
 WITH daily_net AS (
   SELECT
     isin,
     txn_date AS date,
-    sum(CASE WHEN txn_type = 'buy' THEN quantity ELSE -quantity END) AS net_qty
+    sum(CASE WHEN txn_type = 'buy' THEN quantity ELSE -quantity END
+        * adj_factor(isin, txn_date)) AS net_qty   -- current-equivalent units
   FROM transactions
   GROUP BY isin, txn_date
 ),
@@ -172,9 +234,9 @@ qty_as_of AS (
   LEFT JOIN daily_net dn ON dn.isin = g.isin AND dn.date = g.date
 ),
 pf AS (
-  SELECT q.date, sum(q.quantity * ph.close) AS portfolio_value
+  SELECT q.date, sum(q.quantity * pa.close_adjusted) AS portfolio_value
   FROM qty_as_of q
-  JOIN price_history ph ON ph.isin = q.isin AND ph.date = q.date
+  JOIN v_price_adjusted pa ON pa.isin = q.isin AND pa.date = q.date
   WHERE q.quantity > 0
   GROUP BY q.date
 ),

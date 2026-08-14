@@ -81,14 +81,20 @@ built). Manual single-row entry is fine to start.
 
 ---
 
-## Open items before entering long transaction history
+## Open items
 
-- **Split/bonus quantity gap** (see the comment block in `001_phase0_schema.sql`).
-  Holdings derive purely from `transactions`, so a split or bonus silently breaks
-  the share count. This is live for the current watchlist — L&T and Infosys both
-  have historical bonus issues. Resolve with `corporate_actions` in Phase 1 before
-  loading pre-2019 history; bonus and split need *different* handling and must not
-  be collapsed into one adjustment type.
+- ~~Split/bonus quantity gap~~ — **resolved**, see [design-corporate-identity.md](design-corporate-identity.md).
+  `corporate_actions` + `adj_factor()` adjust quantities and prices at query time.
+- ~~ISIN drift~~ — **resolved**, same doc. FKs are `ON UPDATE CASCADE`; renaming
+  `companies.isin` moves all child rows. `isin_aliases` + `resolve_isin()` normalise
+  incoming feed data.
+- **Load the real corporate actions for your 5 companies before entering history.**
+  The mechanism exists but the table is empty. Any pre-bonus/pre-split transaction
+  entered now will show the wrong quantity until the matching action row is added.
+  L&T and Infosys both have historical bonus issues.
+- **The dashboard must surface `v_pending_corporate_actions` as a blocking banner.**
+  Unconfirmed actions are deliberately not applied, so without this banner an
+  unconfirmed bonus silently understates holdings. This is load-bearing, not polish.
 - **`sector_template` field sets** for `it_services` and `pharma` are not designed
   yet — needed before Phase 1 form-template work, not before Phase 0 data entry.
 

@@ -35,7 +35,7 @@ COMMENT ON COLUMN companies.sector_template IS
   'Field sets for it_services and pharma still need designing before Phase 1 form work.';
 
 CREATE TABLE IF NOT EXISTS watchlist (
-  isin       text PRIMARY KEY REFERENCES companies(isin),
+  isin       text PRIMARY KEY REFERENCES companies(isin) ON UPDATE CASCADE,
   added_date date DEFAULT current_date,
   active     boolean DEFAULT true,
   notes      text
@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS watchlist (
 -- Raw EOD prices exactly as reported. NEVER mutated — split/bonus adjustment
 -- happens at query time (v_price_adjusted, Phase 3) against corporate_actions.
 CREATE TABLE IF NOT EXISTS price_history (
-  isin   text REFERENCES companies(isin),
+  isin   text REFERENCES companies(isin) ON UPDATE CASCADE,
   date   date,
   open   numeric,
   high   numeric,
@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS index_history (
 -- retrofit.
 CREATE TABLE IF NOT EXISTS transactions (
   id         bigserial PRIMARY KEY,
-  isin       text NOT NULL REFERENCES companies(isin),
+  isin       text NOT NULL REFERENCES companies(isin) ON UPDATE CASCADE,
   txn_type   text NOT NULL CHECK (txn_type IN ('buy','sell')),
   txn_date   date NOT NULL,
   quantity   numeric NOT NULL CHECK (quantity > 0),
@@ -91,17 +91,10 @@ CREATE TABLE IF NOT EXISTS transactions (
 
 CREATE INDEX IF NOT EXISTS idx_transactions_isin_date ON transactions (isin, txn_date);
 
--- KNOWN GAP (Phase 0 accepts this; decide before entering pre-2019 history):
--- quantity is derived purely from transactions, so a SPLIT or BONUS silently
--- breaks v_holdings — the user's share count changes with no transaction row.
--- This is live for the Phase 0 watchlist (e.g. L&T 1:2 bonus 2017, Infosys 1:1
--- bonus 2018). Two different mechanisms are needed and they are NOT the same:
---   * Bonus  -> arguably a zero-price 'buy' lot: tax-correct, since bonus shares
---               have zero cost of acquisition and their own holding period.
---   * Split  -> must rescale EXISTING lots (quantity up, per-share cost down);
---               it does not create a new lot.
--- Do not paper over this with a single 'adjustment' txn_type. Resolve it with
--- corporate_actions in Phase 1 before loading long transaction history.
+-- Quantity is derived purely from transactions, so a SPLIT or BONUS would break
+-- v_holdings — the share count changes with no transaction row. This is RESOLVED
+-- at query time via corporate_actions + adj_factor() below; transactions stay an
+-- immutable record of what you actually did. See docs/design-corporate-identity.md.
 
 CREATE TABLE IF NOT EXISTS cash_ledger (
   id         bigserial PRIMARY KEY,
@@ -111,6 +104,105 @@ CREATE TABLE IF NOT EXISTS cash_ledger (
   notes      text,
   entered_at timestamptz DEFAULT now()
 );
+
+-- ----------------------------------------------------------------------------
+-- Corporate identity & actions
+--
+-- Two problems, one mechanism (see docs/design-corporate-identity.md):
+--   1. ISINs are NOT immutable. HDFC Bank INE040A01018 -> INE040A01034 and
+--      Sun Pharma INE044A01028 -> INE044A01036, both observed 2026-08-15.
+--   2. Splits and bonuses change share counts with no transaction row.
+--
+-- Identity is handled by UPDATE-in-place: every FK to companies(isin) is
+-- ON UPDATE CASCADE, so changing companies.isin rewrites all child rows
+-- atomically. All stored data therefore always uses the CURRENT ISIN, which
+-- keeps every view free of alias joins. isin_aliases only records history and
+-- normalises INCOMING feed data (which may carry a superseded ISIN).
+-- ----------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS isin_aliases (
+  old_isin     text PRIMARY KEY,
+  current_isin text NOT NULL REFERENCES companies(isin) ON UPDATE CASCADE,
+  changed_on   date,
+  reason       text,
+  entered_at   timestamptz DEFAULT now(),
+  CONSTRAINT isin_alias_not_self CHECK (old_isin <> current_isin)
+);
+
+-- Normalise an incoming ISIN (from a feed, a broker CSV, an old filing) to the
+-- current one. Returns the input unchanged when there is no alias.
+CREATE OR REPLACE FUNCTION resolve_isin(p_isin text) RETURNS text AS $$
+  SELECT COALESCE((SELECT current_isin FROM isin_aliases WHERE old_isin = p_isin), p_isin);
+$$ LANGUAGE sql STABLE;
+
+-- Corporate actions — used for QUERY-TIME adjustment only. price_history and
+-- transactions are never rewritten.
+--
+-- entry_mode/status follow the staged-ingestion contract: the corporate-actions
+-- feed can propose actions by parsing subject text ("Bonus 1:1", "Face Value
+-- Split..."), but a mis-parsed action would silently corrupt every quantity and
+-- price in the app. So ONLY status='confirmed' rows are applied by adj_factor();
+-- unconfirmed ones surface through v_pending_corporate_actions instead.
+CREATE TABLE IF NOT EXISTS corporate_actions (
+  id          bigserial PRIMARY KEY,
+  isin        text NOT NULL REFERENCES companies(isin) ON UPDATE CASCADE,
+  action_type text NOT NULL CHECK (action_type IN ('split','bonus','rights')),
+  ratio_from  numeric NOT NULL CHECK (ratio_from > 0),
+  ratio_to    numeric NOT NULL CHECK (ratio_to   > 0),
+  ex_date     date NOT NULL,
+  notes       text,
+  source_url  text,
+  entry_mode  text NOT NULL DEFAULT 'manual' CHECK (entry_mode IN ('auto','manual')),
+  status      text NOT NULL DEFAULT 'confirmed' CHECK (status IN ('unverified','confirmed')),
+  entered_at  timestamptz DEFAULT now(),
+  updated_at  timestamptz DEFAULT now(),
+  CONSTRAINT uq_corporate_actions UNIQUE (isin, action_type, ex_date)
+);
+
+-- The adjustment factor for ONE action.
+--   split 1:5  (ratio_from 1, ratio_to 5) -> 1 share becomes 5      -> factor 5
+--   bonus 1:1  (ratio_from 1, ratio_to 1) -> 1 free share per 1 held -> factor 2
+--   rights                                -> factor 1, see below
+--
+-- RIGHTS DELIBERATELY DO NOT ADJUST. A rights issue is subscribed at a price and
+-- is optional — it creates a real new lot at a real cost, so it must be entered
+-- as an ordinary 'buy' transaction. Auto-scaling quantities for rights would
+-- invent shares you may never have bought. The action_type is retained only so a
+-- rights event can be recorded for reference.
+CREATE OR REPLACE FUNCTION ca_factor(p_type text, p_from numeric, p_to numeric)
+RETURNS numeric AS $$
+  SELECT CASE p_type
+           WHEN 'split' THEN p_to / p_from
+           WHEN 'bonus' THEN 1 + p_to / p_from
+           ELSE 1
+         END;
+$$ LANGUAGE sql IMMUTABLE;
+
+-- Cumulative factor for everything that happened AFTER p_date.
+--
+-- Deliberately a plpgsql loop doing exact `numeric` multiplication, NOT the
+-- exp(sum(ln(...))) idiom used in an earlier draft of the spec: exp/ln return
+-- double precision, which would smuggle floating-point error into share counts
+-- and prices. That violates the numeric-never-float rule for exactly the reason
+-- the rule exists.
+CREATE OR REPLACE FUNCTION adj_factor(p_isin text, p_date date)
+RETURNS numeric AS $$
+DECLARE f numeric := 1; r record;
+BEGIN
+  FOR r IN
+    SELECT action_type, ratio_from, ratio_to
+    FROM corporate_actions
+    WHERE isin = p_isin AND ex_date > p_date AND status = 'confirmed'
+  LOOP
+    f := f * ca_factor(r.action_type, r.ratio_from, r.ratio_to);
+  END LOOP;
+  RETURN f;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- Symmetry worth remembering: a historical PRICE is divided by the factor and a
+-- historical QUANTITY is multiplied by it, so value (price x quantity) is
+-- invariant across a split or bonus — which is exactly what should happen.
 
 -- ----------------------------------------------------------------------------
 -- Research tables
@@ -124,7 +216,7 @@ CREATE TABLE IF NOT EXISTS cash_ledger (
 
 CREATE TABLE IF NOT EXISTS fundamentals_quarterly (
   id               bigserial PRIMARY KEY,
-  isin             text NOT NULL REFERENCES companies(isin),
+  isin             text NOT NULL REFERENCES companies(isin) ON UPDATE CASCADE,
   period_end       date NOT NULL,
   filing_type      text NOT NULL CHECK (filing_type IN ('standalone','consolidated')),
   revenue          numeric,
@@ -153,7 +245,7 @@ CREATE TABLE IF NOT EXISTS fundamentals_quarterly (
 
 CREATE TABLE IF NOT EXISTS governance_tracking (
   id                     bigserial PRIMARY KEY,
-  isin                   text NOT NULL REFERENCES companies(isin),
+  isin                   text NOT NULL REFERENCES companies(isin) ON UPDATE CASCADE,
   as_of_date             date NOT NULL,
   promoter_holding_pct   numeric,
   promoter_pledge_pct    numeric,   -- key distress signal
@@ -182,7 +274,7 @@ CREATE TABLE IF NOT EXISTS governance_tracking (
 -- Corrections go in as a new dated entry, so past reasoning is never rewritten.
 CREATE TABLE IF NOT EXISTS conviction_log (
   id                    bigserial PRIMARY KEY,
-  isin                  text NOT NULL REFERENCES companies(isin),
+  isin                  text NOT NULL REFERENCES companies(isin) ON UPDATE CASCADE,
   entry_date            date DEFAULT current_date,
   thesis_text           text,
   falsifier_text        text,
@@ -225,6 +317,10 @@ DROP TRIGGER IF EXISTS trg_governance_updated ON governance_tracking;
 CREATE TRIGGER trg_governance_updated BEFORE UPDATE ON governance_tracking
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
+DROP TRIGGER IF EXISTS trg_corporate_actions_updated ON corporate_actions;
+CREATE TRIGGER trg_corporate_actions_updated BEFORE UPDATE ON corporate_actions
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
 -- Snapshot the old row before any update to a research table.
 CREATE OR REPLACE FUNCTION log_research_edit() RETURNS trigger AS $$
 BEGIN
@@ -254,7 +350,7 @@ BEGIN
   FOREACH t IN ARRAY ARRAY[
     'companies','watchlist','price_history','index_history','transactions',
     'cash_ledger','fundamentals_quarterly','governance_tracking','conviction_log',
-    'research_edit_history'
+    'research_edit_history','isin_aliases','corporate_actions'
   ] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
     EXECUTE format('DROP POLICY IF EXISTS auth_only ON %I', t);

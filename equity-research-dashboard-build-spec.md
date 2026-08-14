@@ -609,9 +609,24 @@ on:
 ### Jobs
 
 0. **CI-runner endpoint spike** — `.github/workflows/nse-endpoint-spike.yml`, manual-trigger diagnostic. **Run 2026-08-15: all endpoints (bhavcopy + every `/api/*` used below) returned 200 from a GitHub Actions runner** — see Section 8a. Jobs 1–2b below can all live in CI. Keep the workflow in the repo and re-run it if NSE ever starts blocking CI IPs; don't delete it as "done," it's the early-warning check for a WAF policy change.
-1. **EOD price fetch** — post-market-close on trading days. Upserts into `price_history` **and `index_history`** (index values come from the same bhavcopy download — no extra source, no manual entry).
+1. **EOD price fetch** — post-market-close on trading days. Upserts into `price_history` from the UDiFF bhavcopy **and into `index_history` from the separate all-indices close file** (`ind_close_all_{ddmmyyyy}.csv`). Correction to an earlier draft of this spec: index values do **not** come from the bhavcopy — every bhavcopy row is `FinInstrmTp = STK` and no index appears in it. Both files sit on the same `nsearchives` host, so this is still one job with two downloads, no manual entry. The bhavcopy carries ISIN directly, so match on that, never on symbol.
 2. **Announcement feed diff** — fetches the NSE/BSE corporate announcement feed, filters to ISINs in `watchlist`, inserts matches into `filings_queue` with `document_type` set where inferable. SAST/PIT insider disclosures and rating-agency announcements arrive through this same feed — route them to `insider_transactions` and `rating_actions` respectively.
-2a. **XBRL fundamentals ingestion** — for each watchlist ISIN, poll the financial-results index, download any new `xbrl` file, parse the `in-bse-fin:*` tags (RevenueFromOperations, ProfitLossForPeriod, ProfitBeforeTax, EPS, FinanceCosts, DepreciationDepletionAndAmortisationExpense), and upsert into `fundamentals_quarterly` with `entry_mode='auto', status='unverified'`. CFO and capex are not tagged in every quarterly XBRL (only half-yearly/annual) — leave those fields null for auto rows and let the manual form fill them when confirming. See Section 8a for endpoint details and the staged-ingestion contract.
+2a. **XBRL fundamentals ingestion** — poll `/api/integrated-filing-results` (bulk date-range form with a ~3-day lookback), filter to `type == "Integrated Filing- Financials"`, download each `xbrl` URL, parse, and upsert into `fundamentals_quarterly` as `entry_mode='auto', status='unverified'`. CFO and capex are not tagged in quarterly filings — leave null on auto rows and fill on confirm.
+
+    **Parser requirements — verified 2026-08-15, these are not optional details:**
+    - **Namespace is `in-capmkt`** (`http://www.sebi.gov.in/xbrl/2026-01-31/in-capmkt`), not the pre-2025 `in-bse-fin`. The URI is version-dated, so **match on local-name and ignore the namespace URI**, or the parser breaks at the next SEBI taxonomy revision.
+    - **Two different schemas, identified by filename:**
+      - `INTEGRATED_FILING_INDAS_*` — normal companies: `RevenueFromOperations`, `ProfitBeforeTax`, `ProfitLossForPeriod`, `FinanceCosts`, `DepreciationDepletionAndAmortisationExpense`. EPS was renamed — use `BasicEarningsLossPerShareFromContinuingAndDiscontinuedOperations`.
+      - `INTEGRATED_FILING_BANKING_*` — banks/NBFCs: a **completely different vocabulary** (`InterestEarned`, `InterestExpended`, `Income`, `OperatingProfitBeforeProvisionAndContingencies`, `ProfitLossFromOrdinaryActivitiesBeforeTax`, `BasicEarningsPerShareAfterExtraordinaryItems`). There is no `RevenueFromOperations` at all. **HDFC Bank is this case**, so the MVP watchlist exercises both schemas from day one — good, but it means the bank mapping cannot be deferred.
+    - **`LevelOfRounding` says `Crores` but values are in absolute rupees.** Do not apply the rounding multiplier (HDFC Bank `Income` = 1331103600000 = ₹1,33,110 cr). This is exactly the kind of silent factor-of-10⁷ error that would poison every derived view.
+    - `contextRef` semantics unchanged: `OneD` = the quarter, `FourD` = year-to-date, `OneI` = instant. Q1 filings have no `FourD`. **Ignore any context carrying an `explicitMember`** — those are segment breakdowns, not headline numbers.
+    - Dedupe on (isin, period_end, consolidated) keeping the latest `broadcast_Date`; restatements arrive as new rows with `revised_Date` populated, which `ON CONFLICT DO UPDATE` handles naturally.
+    - The XBRL carries the **current** ISIN (verified `INE040A01034` for HDFC Bank), unlike the legacy filings API — so match on the ISIN inside the file, not on the one in the legacy feed.
+    - Ignore the `pdf_attach` field; it is literally `.../corporate/null` on these rows.
+
+    **Backfill:** the two endpoints tile with no gap — legacy `/api/corporates-financial-results` runs through 23-Jan-2025 (Q3 FY25, `in-bse-fin` tags), and `/api/integrated-filing-results` starts 17-Apr-2025 (Q4 FY25, `in-capmkt`). Keep both parsers if historical fundamentals are wanted.
+
+    **Bonus, not yet exploited:** the same endpoint also returns `type == "Integrated Filing- Governance"` XBRL (~200KB) containing board composition, committee membership, meeting dates and DINs. That is board-governance data rather than the pledge/RPT/auditor fields `governance_tracking` wants, so it does not replace the annual manual pass — but it is free structured data if board-level tracking is ever added. Untested endpoints in the same JS bundle: `/api/annual-reports-xbrl` and `/api/XBRL-announcements`.
 2b. **Shareholding pattern ingestion** — poll `corporate-share-holdings-master` per watchlist ISIN each quarter; upsert promoter/public/FII/DII percentages into `governance_tracking` as `entry_mode='auto', status='unverified'`. RPT, auditor, and CFO/CS-change fields stay null on auto rows — filled once a year during the manual annual-report pass.
 3. **Review-cadence check** — flags any ISIN whose latest `conviction_log` entry is older than 90 days; inserts a `review_due` row into `filings_queue`.
 4. **Nightly backup** — `pg_dump`, gzipped, committed to the private backup repo (see Section 7).
@@ -621,15 +636,21 @@ on:
 
 The manual-entry-reduction plan depends on these; re-verify before relying on them if much time has passed, per CLAUDE.md's "verify at build time" rule.
 
-| Feed | Endpoint | Feeds |
-|---|---|---|
-| UDiFF bhavcopy | `nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{yyyymmdd}_F_0000.csv.zip` | `price_history`, `index_history` |
-| Financial results index | `www.nseindia.com/api/corporates-financial-results?index=equities&symbol=X&period=Quarterly` | Locates the `xbrl` URL per filing |
-| XBRL result file | `nsearchives.nseindia.com/corporate/xbrl/*.xml` | `fundamentals_quarterly` (auto) |
-| Shareholding pattern | `www.nseindia.com/api/corporate-share-holdings-master?index=equities&symbol=X` | `governance_tracking` (auto, ownership fields) |
-| Corporate actions | `www.nseindia.com/api/corporates-corporateActions?index=equities&symbol=X` | `corporate_actions`, dividend pre-fill |
-| Event calendar | `www.nseindia.com/api/event-calendar?index=equities&symbol=X` | `corporate_events` |
-| Announcements | `www.nseindia.com/api/corporate-announcements?index=equities&symbol=X` | `filings_queue` |
+**Freshness audited 2026-08-15 — status codes are not enough.** Every endpoint below was checked for the newest date *inside the payload*, not just HTTP 200. One endpoint returns 200 with a 100KB body while being 19 months stale; that is exactly the failure this table now guards against. Re-audit freshness, not just reachability, whenever these are revisited.
+
+| Feed | Endpoint | Feeds | Freshness (2026-08-15) |
+|---|---|---|---|
+| UDiFF bhavcopy | `nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{yyyymmdd}_F_0000.csv.zip` | `price_history` | ✅ current (T-1). Contains **ISIN directly** (col 7) — no symbol→ISIN mapping needed. All rows are `STK`; **contains NO index data** |
+| **All-indices close** | `nsearchives.nseindia.com/content/indices/ind_close_all_{ddmmyyyy}.csv` | `index_history` | ✅ current. 164 indices with OHLC + index P/E, P/B, div yield. NIFTY 50 close 24395.85 on 13-08-2026 |
+| **Integrated filing results** ⭐ | `www.nseindia.com/api/integrated-filing-results?index=equities&symbol=X` — or bulk: `?index=equities&from_date=DD-MM-YYYY&to_date=DD-MM-YYYY&page=1&size=100` | `fundamentals_quarterly` (auto) — **the current XBRL source** | ✅ current — HDFC Bank Q1 FY27 filed 18-Jul-2026, with `xbrl` (XML) and `ixbrl` (HTML) links. Returns `{data, totalCount}` |
+| Financial results index (legacy) | `www.nseindia.com/api/corporates-financial-results?index=equities&symbol=X&period=Quarterly` | pre-2025 backfill only | ⚠️ **FROZEN AT JAN 2025** — still returns 200 with a full payload. Useful only for historical backfill; never for current data |
+| XBRL result file | `nsearchives.nseindia.com/corporate/xbrl/*.xml` | parsed by the two jobs above | ✅ current files parse cleanly (verified HDFC Bank Q1 FY27) |
+| Shareholding pattern | `www.nseindia.com/api/corporate-share-holdings-master?index=equities&symbol=X` | `governance_tracking` (auto, ownership fields) | ✅ current — period 30-Jun-2026, broadcast 03-Jul-2026 |
+| Corporate actions | `www.nseindia.com/api/corporates-corporateActions?index=equities&symbol=X` | `corporate_actions`, dividend pre-fill | ✅ current — ex-date 19-Jun-2026 |
+| Event calendar | `www.nseindia.com/api/event-calendar?index=equities&symbol=X` | `corporate_events` | ✅ current — 2026 events present |
+| Announcements | `www.nseindia.com/api/corporate-announcements?index=equities&symbol=X` | `filings_queue` | ✅ current — newest 14-Aug-2026. Quarterly results now arrive here as `desc = "Outcome of Board Meeting"` with **PDF** attachments and no XBRL link |
+
+**⚠️ Never source ISINs from the filings or corporate-actions APIs** — they record the ISIN as of filing time and go stale when a company's ISIN changes. Use the bhavcopy as the authority. Confirmed drift: HDFC Bank `INE040A01018` → **`INE040A01034`**, Sun Pharma `INE044A01028` → **`INE044A01036`**. ISINs are not immutable; see the note in `sql/seed/phase0_companies.sql`.
 
 `www.nseindia.com/` itself 403'd even though its `/api/*` endpoints and the `nsearchives` archive subdomain answered — the archive host is the more permissive path.
 
