@@ -1,0 +1,4 @@
+# Deliberately minimal. HTTP uses the standard library (urllib) rather than
+# `requests` — one fewer dependency to rot in a job meant to run unattended for
+# years. psycopg2 is the only thing we genuinely cannot do without.
+psycopg2-binary==2.9.12

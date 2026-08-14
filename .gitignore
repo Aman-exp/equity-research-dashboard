@@ -1,0 +1,25 @@
+# Working documents — kept locally, deliberately not tracked.
+# These are the spec/scope/agent-instruction files, not project deliverables.
+CLAUDE.md
+equity-research-dashboard-build-spec.md
+equity-research-dashboard-requirements.md
+
+# Secrets — never commit. The service_role key and DB URL belong in GitHub Secrets.
+.env
+.env.*
+*.pem
+
+# Frontend (once the React app is scaffolded)
+node_modules/
+dist/
+.vite/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local scratch
+*.csv.zip
+*.log

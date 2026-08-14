@@ -283,6 +283,17 @@ CREATE TABLE IF NOT EXISTS conviction_log (
   entered_at            timestamptz DEFAULT now()
 );
 
+-- Job failure log. GitHub does NOT notify you when a scheduled workflow fails,
+-- so a dashboard banner driven by this table is the ONLY alerting mechanism.
+-- Every scheduled job must write here on exception. Also used for non-exception
+-- alerts that need human attention, e.g. detected ISIN drift.
+CREATE TABLE IF NOT EXISTS job_failures (
+  id         bigserial PRIMARY KEY,
+  job_name   text NOT NULL,
+  error_text text,
+  failed_at  timestamptz DEFAULT now()
+);
+
 -- Audit trail satisfying the requirements doc's append-only mandate: live tables
 -- stay current and easy to query, full correction history is preserved here.
 CREATE TABLE IF NOT EXISTS research_edit_history (
@@ -350,7 +361,7 @@ BEGIN
   FOREACH t IN ARRAY ARRAY[
     'companies','watchlist','price_history','index_history','transactions',
     'cash_ledger','fundamentals_quarterly','governance_tracking','conviction_log',
-    'research_edit_history','isin_aliases','corporate_actions'
+    'research_edit_history','isin_aliases','corporate_actions','job_failures'
   ] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
     EXECUTE format('DROP POLICY IF EXISTS auth_only ON %I', t);

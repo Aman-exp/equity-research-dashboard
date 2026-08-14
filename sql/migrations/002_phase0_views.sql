@@ -200,8 +200,11 @@ JOIN LATERAL (
 -- prevailing then:
 --     qty_at_d x raw_price_d  ==  current_equiv_qty x adjusted_price_d
 -- ----------------------------------------------------------------------------
-CREATE OR REPLACE VIEW v_benchmark_comparison WITH (security_invoker = true) AS
-WITH daily_net AS (
+-- Dropped rather than REPLACEd: CREATE OR REPLACE VIEW cannot add or reorder
+-- columns, and this view gained net_cashflow when TWR was introduced.
+DROP VIEW IF EXISTS v_benchmark_comparison;
+CREATE VIEW v_benchmark_comparison WITH (security_invoker = true) AS
+WITH RECURSIVE daily_net AS (
   SELECT
     isin,
     txn_date AS date,
@@ -240,20 +243,63 @@ pf AS (
   WHERE q.quantity > 0
   GROUP BY q.date
 ),
+-- Net money PUT IN on each date (buys at cost, sells as negative). Needed to
+-- strip contributions out of performance — see the TWR note below.
+cashflow AS (
+  SELECT txn_date AS date,
+         sum(CASE WHEN txn_type = 'buy'  THEN  quantity * price + charges
+                  ELSE -(quantity * price - charges) END) AS net_cashflow
+  FROM transactions
+  GROUP BY txn_date
+),
 idx AS (
   SELECT date, close FROM index_history WHERE index_name = 'NIFTY 50'
+),
+daily AS (
+  SELECT pf.date,
+         pf.portfolio_value,
+         COALESCE(cf.net_cashflow, 0) AS net_cashflow,
+         idx.close                    AS index_close,
+         row_number() OVER (ORDER BY pf.date) AS rn
+  FROM pf
+  JOIN idx ON idx.date = pf.date
+  LEFT JOIN cashflow cf ON cf.date = pf.date
+),
+-- TIME-WEIGHTED RETURN, chain-linked.
+--
+-- Rebasing raw portfolio value against the index is WRONG whenever money is
+-- added: buying more stock raises the value without any performance having
+-- occurred, so the portfolio appears to beat the index purely for depositing
+-- cash. Observed in testing — a single purchase showed as "+41% in one day".
+--
+-- TWR removes that: each day's return is (V_t - CF_t) / V_(t-1), which values
+-- the contribution at cost and credits only actual price movement. Chain-link
+-- the daily factors and the result is comparable to an index like-for-like.
+--
+-- Recursive rather than exp(sum(ln(...))) to keep exact `numeric` arithmetic.
+-- If a position is fully liquidated (V_(t-1) = 0) the chain yields NULL from
+-- that day on, which is honest: there is no return on an empty portfolio.
+twr AS (
+  SELECT rn, date, portfolio_value, net_cashflow, index_close,
+         100::numeric AS portfolio_rebased
+  FROM daily WHERE rn = 1
+  UNION ALL
+  SELECT d.rn, d.date, d.portfolio_value, d.net_cashflow, d.index_close,
+         t.portfolio_rebased
+           * ((d.portfolio_value - d.net_cashflow) / NULLIF(t.portfolio_value, 0))
+  FROM twr t
+  JOIN daily d ON d.rn = t.rn + 1
 )
 SELECT
-  pf.date,
-  pf.portfolio_value,
-  idx.close AS index_close,
-  100 * pf.portfolio_value / first_value(pf.portfolio_value) OVER (ORDER BY pf.date)
-    AS portfolio_rebased,
-  100 * idx.close / first_value(idx.close) OVER (ORDER BY pf.date)
+  t.date,
+  t.portfolio_value,
+  t.net_cashflow,
+  t.index_close,
+  t.portfolio_rebased,
+  100 * t.index_close / first_value(t.index_close) OVER (ORDER BY t.date)
     AS index_rebased
-FROM pf
-JOIN idx ON idx.date = pf.date
-ORDER BY pf.date;
+FROM twr t
+ORDER BY t.date;
 
 -- ----------------------------------------------------------------------------
 -- Data freshness — the dashboard must always show "prices as of {date}".

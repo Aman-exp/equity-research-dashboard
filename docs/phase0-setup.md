@@ -69,10 +69,28 @@ gunzip -c db-YYYYMMDD.sql.gz | psql "postgres://...localhost.../scratch_db"
 
 ## 4. Load price history
 
-Not yet automated in Phase 0 (the scheduled price job is Phase 1). Bootstrap by
-downloading a few bhavcopy files and loading the 5 watchlist ISINs, or wait for the
-Phase 1 job. `v_benchmark_comparison` also needs `index_history` rows with
-`index_name = 'NIFTY 50'`.
+Automated: `.github/workflows/eod-prices.yml` runs `scripts/fetch_eod.py` at 19:00 IST
+on weekdays, pulling the UDiFF bhavcopy (prices) and `ind_close_all` (indices). It only
+needs the `SUPABASE_DB_URL` secret from step 3.
+
+To backfill history, run the workflow manually with `start_date` / `end_date`, or locally:
+
+```bash
+export SUPABASE_DB_URL='postgres://...'
+python scripts/fetch_eod.py 2026-01-01 2026-08-13
+```
+
+Notes:
+- **Only watchlist ISINs are stored.** The daily file has ~3,500 rows; keeping all of it
+  would burn the 500MB free tier on data you never read. Adding a company later means
+  re-running a backfill for it.
+- Weekends and trading holidays produce no file — the job logs and exits 0 rather than
+  alerting. NSE has many holidays; alerting on them would train you to ignore the banner.
+- Re-running any date is safe (all upserts). Verified: re-running the same range twice
+  leaves row counts unchanged.
+- If a watchlist company's ISIN changes, the job **alerts and refuses** to record prices
+  under the stale ISIN rather than guessing. Fix per
+  [design-corporate-identity.md](design-corporate-identity.md).
 
 ## 5. Load transactions
 
@@ -103,7 +121,8 @@ built). Manual single-row entry is fine to start.
 - [ ] `v_price_adjusted` correct for a known split — *Phase 3, view not built yet*
 - [ ] P/E matches Screener.in within rounding — *needs `v_pe_current` + 4 quarters of EPS*
 - [x] RLS enabled and policied on every table — *verify with the query in step 2*
-- [ ] Re-running each scheduled job twice produces no duplicate rows — *Phase 1*
+- [x] Re-running each scheduled job twice produces no duplicate rows — *verified for
+      `fetch_eod.py`: same range twice, row counts unchanged. Re-verify per new job.*
 - [ ] Simulated job failure surfaces the dashboard banner — *Phase 1 (`job_failures`)*
 - [x] No `service_role` key in frontend or committed files — *only in GitHub Secrets*
 - [ ] Backup job produces a restorable gzipped dump — *step 3, restore test required*

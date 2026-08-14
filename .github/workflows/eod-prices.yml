@@ -1,0 +1,54 @@
+name: EOD price + index fetch
+
+# Downloads the UDiFF bhavcopy and the all-indices close file, and upserts
+# watchlist prices into price_history / index_history.
+#
+# Verified 2026-08-15: both files are reachable from GitHub Actions runners
+# (see .github/workflows/nse-endpoint-spike.yml).
+#
+# Required secret:
+#   SUPABASE_DB_URL   Direct Postgres connection string (port 5432, not pooled).
+#                     This is a service-level credential — GitHub Secrets only.
+
+on:
+  schedule:
+    # Market closes 15:30 IST; the bhavcopy lands early evening. 19:00 IST gives
+    # plenty of margin. Weekdays only — weekends produce no file and exit cleanly.
+    - cron: '0 19 * * 1-5'
+      timezone: 'Asia/Kolkata'
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Backfill start (YYYY-MM-DD, optional)'
+        required: false
+      end_date:
+        description: 'Backfill end (YYYY-MM-DD, optional)'
+        required: false
+
+concurrency:
+  # A backfill and the nightly run writing at once would still be safe (all
+  # upserts), but serialising keeps logs readable and is kinder to NSE.
+  group: eod-prices
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Fetch EOD prices and indices
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: python scripts/fetch_eod.py ${{ inputs.start_date }} ${{ inputs.end_date }}
+
+# On failure the script writes a row to job_failures itself before re-raising,
+# so the dashboard banner surfaces it. GitHub does not notify on failed
+# scheduled workflows — that banner is the only alerting mechanism.
