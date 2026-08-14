@@ -1,0 +1,65 @@
+name: NSE endpoint spike check
+
+# Diagnostic only — makes no database writes, requires no secrets.
+# Purpose: find out whether NSE's endpoints (verified working from a residential
+# IP on 2026-08-15 — see nse-endpoints-verified in project memory / build spec
+# Section 8a) also respond from a GitHub Actions runner's datacenter IP.
+# The answer decides whether jobs 1/2/2a/2b in the build spec can live in CI,
+# or whether the www.nseindia.com/api/* ones need to run from a home PC instead.
+# Run manually (workflow_dispatch) before writing any real fetcher job.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  spike:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check NSE endpoints
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+          SYMBOL="RELIANCE"
+          TODAY=$(date -u -d 'yesterday' +%Y%m%d)   # UTC "yesterday" is safely a past IST trading day for a smoke test
+
+          check() {
+            local label="$1" url="$2" referer="${3:-}"
+            local hdr=(-A "$UA")
+            [ -n "$referer" ] && hdr+=(-H "Referer: $referer")
+            local out
+            out=$(curl -s -o /dev/null -w "%{http_code} %{size_download}" --max-time 30 "${hdr[@]}" "$url")
+            echo "$label -> $out ($url)"
+          }
+
+          echo "== Static archive host (nsearchives) =="
+          check "bhavcopy (UDiFF)" \
+            "https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_${TODAY}_F_0000.csv.zip"
+
+          echo
+          echo "== www.nseindia.com API host =="
+          check "homepage (expect possible 403 — informational only)" \
+            "https://www.nseindia.com/"
+          check "financial-results index" \
+            "https://www.nseindia.com/api/corporates-financial-results?index=equities&symbol=${SYMBOL}&period=Quarterly" \
+            "https://www.nseindia.com/companies-listing/corporate-filings-financial-results"
+          check "shareholding pattern" \
+            "https://www.nseindia.com/api/corporate-share-holdings-master?index=equities&symbol=${SYMBOL}" \
+            "https://www.nseindia.com/"
+          check "corporate actions" \
+            "https://www.nseindia.com/api/corporates-corporateActions?index=equities&symbol=${SYMBOL}" \
+            "https://www.nseindia.com/"
+          check "event calendar" \
+            "https://www.nseindia.com/api/event-calendar?index=equities&symbol=${SYMBOL}" \
+            "https://www.nseindia.com/"
+          check "announcements" \
+            "https://www.nseindia.com/api/corporate-announcements?index=equities&symbol=${SYMBOL}" \
+            "https://www.nseindia.com/companies-listing/corporate-filings-announcements"
+
+          echo
+          echo "== Interpretation =="
+          echo "200 on nsearchives bhavcopy -> Job 1 (price fetch) can run from CI as designed."
+          echo "200 on the api.nseindia.com calls -> Jobs 2/2a/2b (announcements, XBRL index, shareholding) can run from CI too."
+          echo "403/000/timeout on the api.* calls with bhavcopy still 200 -> keep price fetch in CI,"
+          echo "  move jobs 2/2a/2b to run from the user's own PC on a schedule instead (see build spec Section 8)."
