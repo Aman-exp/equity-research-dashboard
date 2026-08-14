@@ -1,0 +1,105 @@
+name: Nightly database backup
+
+# Phase 0 requirement — set up now, not later. This database becomes years of
+# irreplaceable, manually-entered research; it is the single most important
+# automation in the project.
+#
+# Dumps Postgres, gzips, and commits into a SEPARATE PRIVATE backup repo.
+#
+# Required secrets (repo settings -> Secrets and variables -> Actions):
+#   SUPABASE_DB_URL    Direct Postgres connection string (NOT the pooled one —
+#                      pg_dump needs a direct session connection, port 5432).
+#                      This is a service-level credential: GitHub Secrets only,
+#                      never in frontend code or committed anywhere.
+#   BACKUP_REPO        owner/name of the private backup repo, e.g. Aman-exp/equity-research-backups
+#   BACKUP_REPO_TOKEN  PAT with `repo` scope on that backup repo.
+
+on:
+  schedule:
+    - cron: '30 2 * * *'          # 02:30 IST nightly — well clear of market hours
+      timezone: 'Asia/Kolkata'
+  workflow_dispatch:              # always available for manual testing
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dump database
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          STAMP=$(date -u +%Y%m%d)
+          mkdir -p out
+          # pg_dump runs from a pinned client image so the dump never breaks from a
+          # client/server version mismatch. A newer pg_dump can dump an older server.
+          docker run --rm postgres:17-alpine \
+            pg_dump "$DB_URL" \
+              --no-owner --no-privileges \
+              --schema=public \
+            | gzip -9 > "out/db-${STAMP}.sql.gz"
+          ls -lh out/
+          # Fail loudly if the dump is suspiciously small (empty/error output).
+          SIZE=$(stat -c%s "out/db-${STAMP}.sql.gz")
+          if [ "$SIZE" -lt 1000 ]; then
+            echo "Dump is only ${SIZE} bytes — treating as failed." >&2
+            exit 1
+          fi
+
+      - name: Check out backup repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.BACKUP_REPO }}
+          token: ${{ secrets.BACKUP_REPO_TOKEN }}
+          path: backup-repo
+
+      - name: Commit dump and prune old ones
+        run: |
+          set -euo pipefail
+          cd backup-repo
+          mkdir -p dumps
+          cp ../out/*.sql.gz dumps/
+
+          # Retention: keep every dump from the last 30 days, then one per month
+          # (the earliest surviving dump in each month) for everything older.
+          #
+          # CAVEAT: deleting files here does NOT shrink the repo — git retains every
+          # blob ever committed. Pruning keeps the working tree tidy and clone-time
+          # checkout small, but repo size still grows monotonically. At this data
+          # volume (a few MB of numeric research) that is fine for many years; if it
+          # ever matters, the fix is rewriting history, not more aggressive pruning.
+          python3 - <<'PY'
+          import os, re, datetime, subprocess
+          d = 'dumps'
+          files = sorted(f for f in os.listdir(d) if re.match(r'db-\d{8}\.sql\.gz$', f))
+          today = datetime.date.today()
+          keep, seen_months = set(), set()
+          for f in files:
+              day = datetime.datetime.strptime(f[3:11], '%Y%m%d').date()
+              if (today - day).days <= 30:
+                  keep.add(f)
+              else:
+                  m = (day.year, day.month)
+                  if m not in seen_months:
+                      seen_months.add(m)
+                      keep.add(f)
+          for f in files:
+              if f not in keep:
+                  print('pruning', f)
+                  subprocess.run(['git', 'rm', '-q', os.path.join(d, f)], check=True)
+          PY
+
+          git config user.name  "backup-bot"
+          git config user.email "backup-bot@users.noreply.github.com"
+          git add dumps
+          if git diff --staged --quiet; then
+            echo "Nothing changed — no commit."
+          else
+            git commit -m "Backup $(date -u +%Y-%m-%d)"
+            git push
+          fi
+
+      # TODO (Phase 1): on failure, write a row into `job_failures` so the dashboard
+      # banner surfaces it. GitHub does NOT notify you when a scheduled workflow
+      # fails, so until that table and banner exist, this job failing is silent —
+      # check the Actions tab periodically in the meantime.

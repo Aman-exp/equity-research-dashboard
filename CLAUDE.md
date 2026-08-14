@@ -39,6 +39,18 @@ CREATE POLICY auth_only ON <t> FOR ALL TO authenticated USING (true) WITH CHECK 
 ```
 Single user — no `user_id` columns anywhere.
 
+### 8. Every view must be `security_invoker`.
+RLS on tables is **not enough** — this project is deliberately view-heavy ("computed values are views, not stored columns"), and a Postgres view runs with its *owner's* privileges by default. A view owned by `postgres` over an RLS-protected table **bypasses that RLS** and is readable through the anon key — the key that ships publicly in the frontend bundle. Locked-down tables plus a default view = the whole portfolio served to anyone who reads your JS. Every `CREATE VIEW` must be:
+```sql
+CREATE OR REPLACE VIEW <v> WITH (security_invoker = true) AS ...;
+```
+Verify after any migration — expect `security_invoker=true` in `reloptions` for every row:
+```sql
+SELECT c.relname, c.reloptions FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public' AND c.relkind = 'v';
+```
+
 ---
 
 ## Data handling
@@ -57,7 +69,8 @@ Single user — no `user_id` columns anywhere.
 
 - **Idempotent always.** Use `INSERT ... ON CONFLICT DO UPDATE`. Jobs must be safe to re-run without duplicating rows.
 - **Verify NSE URL patterns against the live site at build time.** Do not rely on remembered endpoint formats. NSE has moved to the UDiFF bhavcopy format; confirm the current pattern before writing the fetcher.
-  - Endpoints verified 2026-08-15 from a residential IP (bhavcopy, financial-results XBRL index, XBRL files, shareholding pattern, corporate actions, event calendar, announcements — all 200 OK) — see memory `nse-endpoints-verified`. **Not yet verified from a GitHub Actions runner.** Run a spike workflow hitting each endpoint from CI before building the real fetchers — `www.nseindia.com/api/*` may 403 from datacenter IPs even though `nsearchives.nseindia.com` static files likely won't. If `/api/*` is blocked from CI, run those jobs on a schedule from the user's own PC rather than reaching for a paid data source.
+  - Endpoints verified 2026-08-15 from a residential IP (bhavcopy, financial-results XBRL index, XBRL files, shareholding pattern, corporate actions, event calendar, announcements — all 200 OK) — see memory `nse-endpoints-verified`.
+  - **Verified from a GitHub Actions runner on 2026-08-15 too** (`.github/workflows/nse-endpoint-spike.yml`): bhavcopy and all `www.nseindia.com/api/*` endpoints returned 200 from CI. Only the bare homepage 403'd, which nothing depends on. **All scheduled jobs (price, index, announcements, XBRL fundamentals, shareholding pattern) can run in GitHub Actions — no home-PC fallback needed.** Re-run the spike workflow if NSE starts blocking CI later (their WAF policy can change without notice); don't assume this result is permanent.
 - **Trading holidays are normal, not errors.** NSE has many. A missing bhavcopy for a non-trading day should log and exit cleanly, never write to `job_failures` or alert.
 - **Every job writes to `job_failures` on exception.** GitHub does not notify you about failed scheduled workflows — the dashboard banner is the only alerting mechanism.
 - **Cron must be timezone-pinned** with `timezone: 'Asia/Kolkata'`, and every workflow includes `workflow_dispatch` for manual testing.
@@ -88,7 +101,7 @@ Single user — no `user_id` columns anywhere.
 
 - [ ] `v_price_adjusted` produces correct history for a company with a known split
 - [ ] P/E matches a public source (e.g. Screener.in) for one company, within rounding
-- [ ] RLS enabled and policied on every table
+- [ ] RLS enabled and policied on every table, and `security_invoker=true` on every view
 - [ ] Re-running each scheduled job twice produces no duplicate rows
 - [ ] A simulated job failure surfaces the dashboard banner
 - [ ] No `service_role` key anywhere in frontend bundle or committed files

@@ -23,7 +23,7 @@ Chosen because it collapses auth, database, file storage, and scheduled function
 | Auth | Supabase Auth (single user) | No custom auth code needed |
 | File storage | Supabase Storage | For camera-capture attachments |
 | Scheduled jobs | **GitHub Actions** (scheduled workflow) running Python scripts | Free, versioned in your repo, no separate server to maintain |
-| Frontend hosting | Vercel or Netlify (free tier) | HTTPS by default, PWA-friendly |
+| Frontend hosting | **GitHub Pages** | HTTPS by default, PWA-friendly, zero commercial-use ToS ambiguity, collapses hosting into the same GitHub account already used for Actions + backups (see Section 14) |
 | Client data layer | TanStack Query (React Query) | Enforces fetch-fresh-on-focus, prevents stale client caching |
 
 **Option B (custom backend — Node/FastAPI + Neon Postgres + Railway)** remains available if you want more control later, but adds a server you have to run and secure yourself. Not recommended for a solo personal project unless you specifically want the practice.
@@ -88,7 +88,12 @@ companies (
   industry          text,
   listing_date      date,
   fiscal_year_end_month smallint DEFAULT 3,
-  sector_template   text  -- e.g. 'capital_goods', 'bank', 'fmcg' — drives which form fields show
+  sector_template   text  -- e.g. 'capital_goods', 'bank', 'fmcg', 'it_services', 'pharma' — drives which
+                          -- form fields show. Phase 0 watchlist (sql/seed/phase0_companies.sql) uses all
+                          -- five; 'it_services' and 'pharma' are new beyond the original two examples and
+                          -- need their own field set decided (e.g. IT: no order-book fields, different
+                          -- margin drivers; pharma: USFDA/regulatory flags, ANDA pipeline notes) before
+                          -- the fundamentals/governance forms are built.
 );
 
 -- Quarterly fundamentals
@@ -603,7 +608,7 @@ on:
 
 ### Jobs
 
-0. **CI-runner endpoint spike** — a one-off (then occasionally re-run) workflow that curls every endpoint in Section 8a from a GitHub Actions runner and logs status codes. Run this **before** writing jobs 1–2b for real; it decides whether `/api/*` jobs can live in CI or must run from the user's own PC on a schedule instead (see Section 8a and CLAUDE.md).
+0. **CI-runner endpoint spike** — `.github/workflows/nse-endpoint-spike.yml`, manual-trigger diagnostic. **Run 2026-08-15: all endpoints (bhavcopy + every `/api/*` used below) returned 200 from a GitHub Actions runner** — see Section 8a. Jobs 1–2b below can all live in CI. Keep the workflow in the repo and re-run it if NSE ever starts blocking CI IPs; don't delete it as "done," it's the early-warning check for a WAF policy change.
 1. **EOD price fetch** — post-market-close on trading days. Upserts into `price_history` **and `index_history`** (index values come from the same bhavcopy download — no extra source, no manual entry).
 2. **Announcement feed diff** — fetches the NSE/BSE corporate announcement feed, filters to ISINs in `watchlist`, inserts matches into `filings_queue` with `document_type` set where inferable. SAST/PIT insider disclosures and rating-agency announcements arrive through this same feed — route them to `insider_transactions` and `rating_actions` respectively.
 2a. **XBRL fundamentals ingestion** — for each watchlist ISIN, poll the financial-results index, download any new `xbrl` file, parse the `in-bse-fin:*` tags (RevenueFromOperations, ProfitLossForPeriod, ProfitBeforeTax, EPS, FinanceCosts, DepreciationDepletionAndAmortisationExpense), and upsert into `fundamentals_quarterly` with `entry_mode='auto', status='unverified'`. CFO and capex are not tagged in every quarterly XBRL (only half-yearly/annual) — leave those fields null for auto rows and let the manual form fill them when confirming. See Section 8a for endpoint details and the staged-ingestion contract.
@@ -626,7 +631,9 @@ The manual-entry-reduction plan depends on these; re-verify before relying on th
 | Event calendar | `www.nseindia.com/api/event-calendar?index=equities&symbol=X` | `corporate_events` |
 | Announcements | `www.nseindia.com/api/corporate-announcements?index=equities&symbol=X` | `filings_queue` |
 
-`www.nseindia.com/` itself 403'd even though its `/api/*` endpoints and the `nsearchives` archive subdomain answered — the archive host is the more permissive path. **Untested from a GitHub Actions runner** — see Job 0 above.
+`www.nseindia.com/` itself 403'd even though its `/api/*` endpoints and the `nsearchives` archive subdomain answered — the archive host is the more permissive path.
+
+**Confirmed from a GitHub Actions runner (2026-08-15, Job 0 result):** bhavcopy and all `/api/*` endpoints above returned 200 from CI — only the bare homepage 403'd, and nothing depends on it. **All jobs 1/2/2a/2b run in GitHub Actions; no home-PC fallback is needed.** If NSE's WAF policy changes later and CI starts getting blocked, re-run `.github/workflows/nse-endpoint-spike.yml` to confirm before assuming — don't guess from a stale result.
 
 **Staged ingestion / review inbox:** every job in this section writes `entry_mode='auto', status='unverified'` rows (per the constraint added to `fundamentals_quarterly` and `governance_tracking`). The dashboard needs a review-inbox view listing unverified rows across both tables; confirming is a single tap that flips `status`, editing is a normal form pre-filled with the ingested values. This is the mechanism that turns "transcribe 15 numbers" into "glance and confirm" — see CLAUDE.md's manual-entry-is-fallback rule.
 
@@ -640,7 +647,7 @@ Required mitigations, built in from Phase 1:
 - **Retry with exponential backoff**, and a proper cookie/session handshake (`Referer` + `User-Agent` headers) if any endpoint requires it.
 - **Failure alerting is mandatory** — GitHub does **not** notify you when a scheduled workflow fails. Without alerting, the daily feed can be dead for weeks unnoticed. Cheapest reliable option: on job failure, write a row into a `job_failures` table; the dashboard displays a persistent banner if any row is newer than 24h. No email service or paid dependency needed.
 - **Staleness indicator on the dashboard** — always show "prices as of {max(price_history.date)}". If that date is stale, you see it immediately rather than acting on old data.
-- **Fallback:** if NSE proves too unreliable from CI runners, a free-tier broker API (Dhan/Fyers/Upstox) is the more stable EOD **price** source — register the key up front rather than after failures start, per the decision in Section 14. Note this fallback covers prices only: brokers do not carry XBRL, shareholding-pattern, or announcement data, so if `www.nseindia.com/api/*` is CI-blocked, the fix for jobs 2/2a/2b is running them from the user's own PC on a schedule, not swapping data source.
+- **Fallback (currently dormant — CI access confirmed working, see Section 8a):** if NSE ever starts blocking CI runners, a free-tier broker API (Dhan/Fyers/Upstox) is the fallback EOD **price** source — the key should still be registered up front per Section 14, as cheap insurance even though it's not load-bearing today. Note this fallback covers prices only: brokers do not carry XBRL, shareholding-pattern, or announcement data, so if `www.nseindia.com/api/*` ever becomes CI-blocked, the fix for jobs 2/2a/2b is running them from the user's own PC on a schedule, not swapping data source.
 
 ```sql
 job_failures (
@@ -688,7 +695,7 @@ job_failures (
 | Item | Cost |
 |---|---|
 | Supabase (DB + Auth + Storage + free-tier compute) | $0 |
-| Vercel (frontend hosting) | $0 |
+| GitHub Pages (frontend hosting) | $0 |
 | GitHub Actions (scheduled jobs) | $0 |
 | GitHub private repo (backups) | $0 |
 | Domain name | **Skip it** — use the free Vercel subdomain |
@@ -708,7 +715,7 @@ job_failures (
 | Service | Free limit | Fit |
 |---|---|---|
 | Supabase | 500MB database, 1GB file storage, 5GB egress, 500,000 Edge Function calls/month | Numeric data (prices, fundamentals) stays a few MB even after years — comfortable margin |
-| Vercel (Hobby) | 100GB bandwidth, 1M function invocations/month; restricted to non-commercial personal use | Exact fit — this project is never commercialized |
+| GitHub Pages | 100GB bandwidth/month, 1GB site size, unlimited builds via Actions minutes | Comfortable margin — a small research dashboard is nowhere near either cap; no commercial-use clause to track at all |
 | GitHub Actions | 2,000 free minutes/month on a private repo | Three daily jobs at ~1–3 min each ≈ 100–300 min/month — large headroom |
 
 ### Three traps to design around (not just monitor)
@@ -734,8 +741,9 @@ Settled (2026-08-15):
 - **`filing_type` convention: consolidated** where available, falling back to standalone only when a company reports no consolidated figures.
 - **EOD price source:** register a free-tier broker API key (Dhan/Fyers/Upstox) **up front**, not only after NSE fails from CI — filings/XBRL/announcements still depend on NSE regardless, so the broker key removes price-fetch risk without removing the NSE dependency entirely. NSE bhavcopy (UDiFF) remains the primary attempt; the broker key is the ready fallback, not a deferred decision.
 
+- **Hosting: GitHub Pages**, not Vercel. Both are $0 with no card; GitHub Pages wins on the dimension that matters most here (Section 8a/CLAUDE.md's cost-and-risk-minimization intent) — no commercial-use ToS to ever drift out of compliance with, and it collapses hosting into the same GitHub account already running Actions and backups, one fewer third-party service in the stack. Cost: a small Actions build step (`npm run build` → publish `dist/`) instead of Vercel's zero-config git-push deploy. Frontend is fully static (Supabase is the only backend), so nothing functional is lost — Web Share Target / PWA install work identically on static file hosting.
+
 Still open:
-- **Hosting:** Vercel Hobby is a clean fit (this is personal and non-commercial). If you'd rather avoid the commercial-use clause entirely, the frontend is fully static and can serve from GitHub Pages at the same $0.
 - Initial 5-company watchlist — which companies?
 
 ---
