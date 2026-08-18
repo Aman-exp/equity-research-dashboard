@@ -143,11 +143,22 @@ export default function Dashboard({ onOpen }) {
   )
 }
 
-/** Portfolio degrades to an honest empty state rather than pretending. */
+/** Portfolio degrades to an honest empty state rather than pretending — but an
+ *  RLS/auth denial is NOT the same thing as "no transactions yet" and must not
+ *  be silently presented as one. Conflating them would read as a real empty
+ *  portfolio during, say, an expired session, when access was actually denied. */
 function Portfolio({ query }) {
   const rows = query.data ?? []
   const total = rows.reduce((s, r) => s + Number(r.current_value ?? 0), 0)
   const pnl = rows.reduce((s, r) => s + Number(r.unrealized_pnl ?? 0), 0)
+
+  if (query.isError) {
+    return (
+      <section className="rounded-xl border border-rose-300 bg-rose-50 p-4 text-sm text-rose-900 dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-200">
+        Could not load portfolio: {query.error.message}
+      </section>
+    )
+  }
 
   if (!query.isLoading && rows.length === 0) {
     return (
