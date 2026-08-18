@@ -1,0 +1,43 @@
+name: Corporate actions fetch
+
+# Stages splits and bonuses for watchlist companies as `unverified`, for review
+# via v_pending_corporate_actions. These are load-bearing for correctness: without
+# them a split or bonus silently breaks share counts and makes historical prices
+# incomparable. See docs/design-corporate-identity.md.
+#
+# Weekly rather than daily — corporate actions are rare, ex-dates are announced
+# well in advance, and this is 5 API calls per run.
+#
+# Required secret: SUPABASE_DB_URL (direct connection, port 5432).
+
+on:
+  schedule:
+    - cron: '0 7 * * 6'          # Saturday 07:00 IST, markets closed
+      timezone: 'Asia/Kolkata'
+  workflow_dispatch:
+
+concurrency:
+  group: corporate-actions
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Fetch corporate actions
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: python scripts/fetch_corporate_actions.py
+
+# Newly staged actions do NOT take effect until confirmed — adj_factor() ignores
+# unverified rows. The dashboard must surface v_pending_corporate_actions, or a
+# real bonus will sit unapplied and quietly understate holdings.

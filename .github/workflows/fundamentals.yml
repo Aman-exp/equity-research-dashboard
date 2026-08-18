@@ -1,0 +1,47 @@
+name: XBRL fundamentals ingestion
+
+# The centerpiece of reducing manual entry: quarterly results land as
+# unverified rows for one-tap confirmation instead of hand transcription.
+# Source: /api/integrated-filing-results (the CURRENT endpoint — the legacy
+# corporates-financial-results API is frozen at Jan-2025; see build spec 8a).
+#
+# Daily rather than weekly: results cluster around quarter-ends and the review
+# inbox is most useful the day a filing lands. Idempotent — re-runs skip
+# already-ingested filings by source_url, so daily runs are nearly free.
+#
+# Required secret: SUPABASE_DB_URL (direct connection, port 5432).
+
+on:
+  schedule:
+    - cron: '30 20 * * *'        # 20:30 IST daily; board meetings can be any day
+      timezone: 'Asia/Kolkata'
+  workflow_dispatch:
+
+concurrency:
+  group: fundamentals
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Ingest quarterly XBRL filings
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: python scripts/fetch_fundamentals.py
+
+# Failure paths all surface on the dashboard banner via job_failures:
+#   - a whole-job exception
+#   - an XBRL file 404 on the archive host (seen in the wild: L&T Mar-2025)
+#   - a revised filing that differs from a row the user already CONFIRMED
+#     (never overwritten silently — restatements need human eyes)
+#   - an ISIN mismatch between the filing and `companies` (possible drift)

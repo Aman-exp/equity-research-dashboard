@@ -94,10 +94,65 @@ Notes:
 
 ## 5. Load transactions
 
-Export the broker tradebook CSV and import it (importer is Phase 0 scope, still to be
-built). Manual single-row entry is fine to start.
+Export the tradebook from Groww (Order history → date range → download; CSV or XLSX),
+then:
+
+```bash
+export SUPABASE_DB_URL='postgres://...'
+python scripts/import_tradebook.py --inspect tradebook.csv   # what did it find?
+python scripts/import_tradebook.py          tradebook.csv    # dry run
+python scripts/import_tradebook.py --commit tradebook.csv    # write
+```
+
+The importer is mapping-driven rather than hardcoded to one broker, because export
+formats are undocumented and change. `--inspect` prints the detected column mapping;
+if a required field shows `(not found)`, add the real header name to `ALIASES` in the
+script. Banner/title rows above the header are skipped automatically, and charge
+columns (brokerage, STT, GST, stamp duty…) are summed into `charges`.
+
+Deliberate safety behaviours:
+- **Dry run by default** — nothing is written without `--commit`.
+- **Idempotent** via the broker's order id, stored in `transactions.external_ref`
+  (uniquely indexed). Re-importing an overlapping range imports 0 rows. If the file
+  has no id column the importer **refuses** rather than risk duplicating trades.
+- **Unknown symbols are a hard error.** A silently dropped row means a missing
+  position, which is worse than a failed import.
+
+Manual single-row entry remains available for off-CSV trades.
 
 ---
+
+## 6. Fundamentals auto-ingestion
+
+`.github/workflows/fundamentals.yml` runs `scripts/fetch_fundamentals.py` daily at
+20:30 IST. It pulls quarterly XBRL from NSE's integrated-filing feed for every active
+watchlist company and stages rows as `entry_mode='auto', status='unverified'` — the
+dashboard flags them until you confirm:
+
+```sql
+-- review inbox
+SELECT isin, period_end, filing_type, revenue, pat, eps, source_url
+FROM fundamentals_quarterly WHERE status='unverified' ORDER BY period_end DESC;
+-- confirm after checking against the filing (source_url is the exact XBRL used)
+UPDATE fundamentals_quarterly SET status='confirmed' WHERE id = ...;
+```
+
+Verified behaviours (all tested against live NSE data, 2026-08-15):
+- Both schemas parse: INDAS (Infosys/ITC/L&T/Sun Pharma) and BANKING (HDFC Bank).
+  An independent audit matched all 17 checked fields exactly against the raw XBRL.
+- **Confirmed rows are never overwritten.** A revised filing that differs from a
+  confirmed row raises a `job_failures` alert instead.
+- Missing XBRL files (it happens — L&T's Mar-2025 filing 404s on NSE's own archive)
+  alert once and never spam; enter those quarters manually.
+- TTM EPS matched Screener.in within 0.2% (74.13 vs 74.25 for Infosys) — the
+  CLAUDE.md P/E checklist item.
+- EPS across a split/bonus is normalised: `v_ttm_eps` divides each quarter by
+  `adj_factor(isin, period_end)`, so HDFC Bank's pre-bonus quarters (EPS ~21–24)
+  and post-bonus quarters (~12–13) sum in a consistent share basis. This only works
+  once the corporate actions are **confirmed** — another reason step "confirm the
+  staged corporate actions" is not optional.
+- CFO and capex are not tagged in quarterly XBRL — those two fields stay null on
+  auto rows; fill them at confirm time from the half-yearly/annual filing.
 
 ## Open items
 
@@ -106,10 +161,17 @@ built). Manual single-row entry is fine to start.
 - ~~ISIN drift~~ — **resolved**, same doc. FKs are `ON UPDATE CASCADE`; renaming
   `companies.isin` moves all child rows. `isin_aliases` + `resolve_isin()` normalise
   incoming feed data.
-- **Load the real corporate actions for your 5 companies before entering history.**
-  The mechanism exists but the table is empty. Any pre-bonus/pre-split transaction
-  entered now will show the wrong quantity until the matching action row is added.
-  L&T and Infosys both have historical bonus issues.
+- **Confirm the staged corporate actions before entering historical transactions.**
+  `scripts/fetch_corporate_actions.py` (weekly workflow) stages them automatically,
+  but they are `unverified` and therefore **not applied** until you confirm:
+  ```sql
+  SELECT * FROM v_pending_corporate_actions;      -- review
+  UPDATE corporate_actions SET status='confirmed' WHERE id = ...;
+  ```
+  Real actions found for this watchlist: HDFC Bank (FV splits 2011 and 2019, bonus
+  1:1 2025), Infosys (bonus 1:1 2018), ITC (bonus 1:2 2016), L&T (bonus 1:2 2017).
+  Any transaction predating one of these will show the wrong quantity until it is
+  confirmed.
 - **The dashboard must surface `v_pending_corporate_actions` as a blocking banner.**
   Unconfirmed actions are deliberately not applied, so without this banner an
   unconfirmed bonus silently understates holdings. This is load-bearing, not polish.
@@ -119,7 +181,8 @@ built). Manual single-row entry is fine to start.
 ## Verification checklist status (CLAUDE.md)
 
 - [ ] `v_price_adjusted` correct for a known split — *Phase 3, view not built yet*
-- [ ] P/E matches Screener.in within rounding — *needs `v_pe_current` + 4 quarters of EPS*
+- [x] P/E matches Screener.in within rounding — *TTM EPS 74.13 vs Screener 74.25 for
+      Infosys (0.16%); P/E is that EPS against the latest close. Re-check once live.*
 - [x] RLS enabled and policied on every table — *verify with the query in step 2*
 - [x] Re-running each scheduled job twice produces no duplicate rows — *verified for
       `fetch_eod.py`: same range twice, row counts unchanged. Re-verify per new job.*

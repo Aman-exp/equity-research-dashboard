@@ -36,6 +36,7 @@ import zipfile
 import urllib.request
 import urllib.error
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 
 import psycopg2
 import psycopg2.extras
@@ -105,14 +106,16 @@ def parse_bhavcopy(blob, wanted_isins):
             continue
 
         def num(key):
+            # Decimal, not float — these land in `numeric` columns.
             v = (row.get(key) or "").strip()
-            return float(v) if v else None
+            return Decimal(v) if v else None
 
+        vol = (row.get("TtlTradgVol") or "").strip()
         out[isin] = (
             isin,
             datetime.strptime(row["TradDt"].strip(), "%Y-%m-%d").date(),
             num("OpnPric"), num("HghPric"), num("LwPric"), num("ClsPric"),
-            int(float(row["TtlTradgVol"])) if (row.get("TtlTradgVol") or "").strip() else None,
+            int(Decimal(vol)) if vol else None,
         )
     return list(out.values()), symbols
 
@@ -127,7 +130,7 @@ def parse_indices(blob, on_date):
         close = (row.get("Closing Index Value") or "").strip()
         if not close:
             continue
-        rows.append((name, on_date, float(close)))
+        rows.append((name, on_date, Decimal(close)))
     return rows
 
 

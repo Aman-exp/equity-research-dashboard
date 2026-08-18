@@ -7,7 +7,21 @@ equity-research-dashboard-requirements.md
 # Secrets — never commit. The service_role key and DB URL belong in GitHub Secrets.
 .env
 .env.*
+!.env.example
 *.pem
+
+# Broker statements and personal financial exports. These carry your name and
+# client code and must never reach GitHub, private repo or not. Import them from
+# outside the repo, or leave them here knowing they are ignored.
+*.xlsx
+*.xls
+*.pdf
+tradebook*.csv
+*Capital_Gains*
+*Demat*
+*Ledger*
+*Statement*
+*Report_[0-9]*
 
 # Frontend (once the React app is scaffolded)
 node_modules/

@@ -135,6 +135,14 @@ SELECT COALESCE(sum(amount), 0) AS cash_available FROM cash_ledger;
 -- Trailing-twelve-month EPS: sum of the last 4 quarters.
 -- P/E must use TTM EPS, never a single quarter's EPS.
 --
+-- EPS is a PER-SHARE metric, so quarters filed before a split/bonus are in a
+-- different share basis than quarters filed after. Summing them raw would mix
+-- bases (HDFC Bank's 1:1 bonus in Aug-2025 makes pre-bonus EPS 2x the current
+-- basis). Divide each quarter's EPS by adj_factor(isin, period_end) — the same
+-- adjustment as prices — so all four quarters are in today's share terms.
+-- Ind AS 33 makes filings from AFTER the event retrospectively adjusted already;
+-- those quarters have factor 1, so the division is a no-op for them.
+--
 -- has_unverified surfaces (rather than hides) staged auto-ingested rows, per the
 -- staged-ingestion contract: the UI flags the number, the user decides — the
 -- system never silently includes or excludes unconfirmed data.
@@ -143,9 +151,9 @@ CREATE OR REPLACE VIEW v_ttm_eps WITH (security_invoker = true) AS
 SELECT
   isin,
   filing_type,
-  max(period_end)                             AS as_of,
-  sum(eps)                                    AS eps_ttm,
-  bool_or(status = 'unverified')              AS has_unverified
+  max(period_end)                                          AS as_of,
+  sum(eps / adj_factor(isin, period_end))                  AS eps_ttm,
+  bool_or(status = 'unverified')                           AS has_unverified
 FROM (
   SELECT
     f.*,

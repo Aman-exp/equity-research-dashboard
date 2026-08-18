@@ -85,11 +85,20 @@ CREATE TABLE IF NOT EXISTS transactions (
   price      numeric NOT NULL CHECK (price >= 0),
   charges    numeric DEFAULT 0 CHECK (charges >= 0),  -- brokerage + STT + stamp duty + GST
   notes      text,
+  -- Broker's own trade/order id, used to make CSV import idempotent. Without it,
+  -- re-importing an overlapping date range would silently duplicate every trade
+  -- and inflate holdings. Nullable so manual entry needs no id; unique when
+  -- present. Two genuine identical fills on one day are distinct trades with
+  -- distinct broker ids, so this is safer than deduping on trade contents.
+  external_ref text,
+  source       text,     -- e.g. 'groww_csv', 'manual'
   entered_at timestamptz DEFAULT now(),
   updated_at timestamptz DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_transactions_isin_date ON transactions (isin, txn_date);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_transactions_external_ref
+  ON transactions (external_ref) WHERE external_ref IS NOT NULL;
 
 -- Quantity is derived purely from transactions, so a SPLIT or BONUS would break
 -- v_holdings — the share count changes with no transaction row. This is RESOLVED
