@@ -7,10 +7,13 @@ name: Nightly database backup
 # Dumps Postgres, gzips, and commits into a SEPARATE PRIVATE backup repo.
 #
 # Required secrets (repo settings -> Secrets and variables -> Actions):
-#   SUPABASE_DB_URL    Direct Postgres connection string (NOT the pooled one —
-#                      pg_dump needs a direct session connection, port 5432).
-#                      This is a service-level credential: GitHub Secrets only,
-#                      never in frontend code or committed anywhere.
+#   SUPABASE_DB_URL    Supabase SESSION POOLER connection string, port 5432:
+#                        postgresql://postgres.<ref>:<pw>@aws-<region>.pooler.supabase.com:5432/postgres
+#                      NOT the direct connection: on the free tier that resolves to
+#                      IPv6 only, and GitHub Actions runners are IPv4-only, so it
+#                      fails with "Network is unreachable". NOT the transaction
+#                      pooler (port 6543) either — pg_dump needs session mode.
+#                      Service-level credential: GitHub Secrets only, never committed.
 #   BACKUP_REPO        owner/name of the private backup repo, e.g. Aman-exp/equity-research-backups
 #   BACKUP_REPO_TOKEN  PAT with `repo` scope on that backup repo.
 

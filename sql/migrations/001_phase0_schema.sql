@@ -378,3 +378,44 @@ BEGIN
       'CREATE POLICY auth_only ON %I FOR ALL TO authenticated USING (true) WITH CHECK (true)', t);
   END LOOP;
 END $$;
+
+-- ----------------------------------------------------------------------------
+-- Table-level GRANTs.
+--
+-- RLS filters ROWS; it does nothing unless the role can already read the table
+-- at all. Older Supabase projects auto-granted this on every new table, which is
+-- why "just enable RLS and add a policy" used to be sufficient. Projects created
+-- since Supabase's 2026 security default change do NOT auto-grant, so this is
+-- now explicit rather than implicit — deliberately, matching the project's
+-- stance of never relying on a platform default holding (see the
+-- security_invoker rule, CLAUDE.md rule 8, which exists for the same reason).
+--
+-- `anon` gets schema USAGE only — enough for PostgREST to see the schema exists
+-- and return a clean 403, not table-level access. Every real grant goes to
+-- `authenticated` only, matching the RLS policies above. There is no login flow
+-- yet (Phase 0), so until Supabase Auth is wired into the frontend, the anon
+-- key the frontend currently uses gets nothing back — expected, not a bug.
+-- ----------------------------------------------------------------------------
+
+GRANT USAGE ON SCHEMA public TO anon, authenticated;
+
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY[
+    'companies','watchlist','price_history','index_history','transactions',
+    'cash_ledger','fundamentals_quarterly','governance_tracking','conviction_log',
+    'research_edit_history','isin_aliases','corporate_actions','job_failures'
+  ] LOOP
+    EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON %I TO authenticated', t);
+  END LOOP;
+END $$;
+
+-- Sequences back every bigserial PK; INSERT needs USAGE on them too.
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO authenticated;
+
+-- Function EXECUTE grants: resolve_isin() is called from client-side upsert
+-- logic (e.g. the tradebook importer normalising an incoming ISIN).
+GRANT EXECUTE ON FUNCTION resolve_isin(text) TO authenticated;
+GRANT EXECUTE ON FUNCTION ca_factor(text, numeric, numeric) TO authenticated;
+GRANT EXECUTE ON FUNCTION adj_factor(text, date) TO authenticated;

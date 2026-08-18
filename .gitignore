@@ -9,6 +9,7 @@ equity-research-dashboard-requirements.md
 .env.*
 !.env.example
 *.pem
+.secrets/
 
 # Broker statements and personal financial exports. These carry your name and
 # client code and must never reach GitHub, private repo or not. Import them from

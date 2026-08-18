@@ -8,7 +8,9 @@ name: Corporate actions fetch
 # Weekly rather than daily — corporate actions are rare, ex-dates are announced
 # well in advance, and this is 5 API calls per run.
 #
-# Required secret: SUPABASE_DB_URL (direct connection, port 5432).
+# Required secret: SUPABASE_DB_URL — Supabase SESSION POOLER string, port 5432
+# (the direct connection is IPv6-only on the free tier and unreachable from
+# GitHub's IPv4-only runners). See docs/phase0-setup.md step 1.
 
 on:
   schedule:

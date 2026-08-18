@@ -319,3 +319,22 @@ SELECT
   (SELECT count(*) FROM fundamentals_quarterly WHERE status = 'unverified')
     + (SELECT count(*) FROM governance_tracking WHERE status = 'unverified')
     AS unverified_rows;
+
+-- ----------------------------------------------------------------------------
+-- GRANTs — views are relations too and need their own table-level privilege,
+-- same reasoning as the GRANT block at the end of 001_phase0_schema.sql. A view
+-- can have security_invoker=true and still be unreadable without this; it can
+-- also, with security_invoker=true, never leak beyond what the underlying
+-- table's RLS already allows even though it is granted here.
+-- ----------------------------------------------------------------------------
+DO $$
+DECLARE v text;
+BEGIN
+  FOREACH v IN ARRAY ARRAY[
+    'v_price_adjusted','v_holdings','v_pending_corporate_actions','v_portfolio_summary',
+    'v_concentration','v_cash_position','v_ttm_eps','v_pe_current',
+    'v_benchmark_comparison','v_data_freshness'
+  ] LOOP
+    EXECUTE format('GRANT SELECT ON %I TO authenticated', v);
+  END LOOP;
+END $$;

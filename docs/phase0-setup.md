@@ -18,9 +18,31 @@ Order matters. Each step assumes the previous one succeeded.
 
 - Free tier. **Do not add a payment method** (see CLAUDE.md rule 5 — with no card on
   file the project is architecturally incapable of costing money).
-- Region: closest to you (Singapore/Mumbai).
-- Save the direct Postgres connection string (port `5432`, *not* the pooled one) —
-  the backup job needs a direct session connection.
+- Region: **Mumbai (ap-south-1)** or Singapore.
+- **Save the database password shown at creation.** It is displayed once and cannot
+  be retrieved later (only reset), and every scheduled job needs it.
+
+### Which connection string — this matters, and the obvious choice is wrong
+
+Supabase offers three. Use the **Session pooler**:
+
+| | Host / port | Network | Verdict |
+|---|---|---|---|
+| Direct | `db.<ref>.supabase.co:5432` | **IPv6 only** on free tier | ❌ GitHub Actions runners are IPv4-only — jobs fail with `Network is unreachable` |
+| **Session pooler** | `aws-<region>.pooler.supabase.com:5432` | IPv4 | ✅ **use this** — session mode supports all Postgres features, including `pg_dump` |
+| Transaction pooler | `aws-<region>.pooler.supabase.com:6543` | IPv4 | ❌ incompatible with `pg_dump`; for serverless only |
+
+Find it under **Project Settings → Database → Connection string → Session pooler**.
+
+Note the username differs from the direct string — it is `postgres.<project-ref>`, not
+plain `postgres`:
+
+```
+postgresql://postgres.<project-ref>:<password>@aws-<region>.pooler.supabase.com:5432/postgres
+```
+
+This one value is `SUPABASE_DB_URL` for every job and for the backup. It is a secret:
+GitHub Secrets only, never committed, never pasted into a chat.
 
 ## 2. Run the migrations
 
@@ -30,22 +52,14 @@ In the Supabase SQL editor, in this order:
 2. `sql/migrations/002_phase0_views.sql` — computed views
 3. `sql/seed/phase0_companies.sql` — the 5 MVP companies + watchlist
 
-Then verify RLS actually took (CLAUDE.md verification checklist):
+4. `sql/verify_setup.sql` — **every row must say PASS**
 
-```sql
--- Expect rowsecurity = true for every row. Any false is a publicly readable table.
-SELECT tablename, rowsecurity
-FROM pg_tables
-WHERE schemaname = 'public'
-ORDER BY tablename;
-
--- Expect security_invoker = true on every view. Without it, a view over an
--- RLS-protected table is readable through the anon key.
-SELECT c.relname, c.reloptions
-FROM pg_class c
-JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE n.nspname = 'public' AND c.relkind = 'v';
-```
+That last one is not optional. The dangerous failures here are silent: a view
+missing `security_invoker` serves your entire portfolio to the public anon key, and
+an un-policied table is readable through the auto-generated REST API. Neither raises
+an error anywhere. The script checks all 13 tables, all 10 views, the functions, the
+seed and the corporate-action factor arithmetic in one pass, and has been tested to
+actually catch each of those faults rather than always reporting PASS.
 
 ## 3. Set up the backup job (Phase 0, not later)
 
@@ -55,7 +69,7 @@ Then add these repo secrets here (Settings → Secrets and variables → Actions
 
 | Secret | Value |
 |---|---|
-| `SUPABASE_DB_URL` | Direct Postgres connection string from step 1 |
+| `SUPABASE_DB_URL` | **Session pooler** connection string from step 1 (port 5432) |
 | `BACKUP_REPO` | `owner/name` of the backup repo |
 | `BACKUP_REPO_TOKEN` | PAT with `repo` scope on the backup repo |
 

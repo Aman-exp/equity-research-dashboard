@@ -7,8 +7,10 @@ name: EOD price + index fetch
 # (see .github/workflows/nse-endpoint-spike.yml).
 #
 # Required secret:
-#   SUPABASE_DB_URL   Direct Postgres connection string (port 5432, not pooled).
-#                     This is a service-level credential — GitHub Secrets only.
+#   SUPABASE_DB_URL   Supabase SESSION POOLER connection string, port 5432
+#                     (the direct connection is IPv6-only on the free tier and
+#                     unreachable from GitHub's IPv4-only runners).
+#                     Service-level credential — GitHub Secrets only.
 
 on:
   schedule:
