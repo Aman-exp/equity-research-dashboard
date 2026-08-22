@@ -325,8 +325,22 @@ def main():
                 # one request timed out — on 2025-09-13, a SATURDAY, a day with
                 # no data to lose. Both cases mean the same thing to this loop:
                 # note the gap, move on.
-                print(f"  {day}: unreachable — {exc}")
-                throttled_days.append(day.isoformat())
+                # A WEEKEND is never a trading day, so there is nothing to be
+                # missing. NSE does not always answer a request for a
+                # non-existent file with a prompt 404 — during the 2025-09
+                # stretch it stalled instead — and treating that as a hole in
+                # the price history raised a red banner naming 11 Saturdays and
+                # Sundays (observed 2026-08-22). A banner that cries wolf is
+                # worse than no banner. Weekday holidays are indistinguishable
+                # from a genuinely throttled session without a holiday
+                # calendar, so those still get reported, with wording that says
+                # so.
+                if day.weekday() >= 5:
+                    print(f"  {day}: no data (weekend) — {exc}")
+                    skipped.append(day.isoformat())
+                else:
+                    print(f"  {day}: unreachable — {exc}")
+                    throttled_days.append(day.isoformat())
                 day += timedelta(days=1)
                 time.sleep(pause * 3)               # back off harder before continuing
                 continue
@@ -395,18 +409,18 @@ def main():
         if skipped:
             print(f"no data (holiday/weekend/unpublished): {len(skipped)} day(s)")
 
-        # An unreachable day is a HOLE in the price history, not a holiday. Say so
+        # An unreachable WEEKDAY may be a hole in the price history. Say so
         # loudly, and make the alert actionable: re-running the same range costs
         # almost nothing because completed days are skipped.
         if throttled_days:
-            msg = (f"EOD backfill could not fetch {len(throttled_days)} day(s) — NSE "
-                   f"returned a web page instead of the file (WAF throttling), or "
-                   f"the request timed out. These "
-                   f"dates are MISSING from price history: "
+            msg = (f"EOD fetch could not reach NSE for {len(throttled_days)} weekday(s) "
+                   f"— throttled, or the request timed out. If any of these was a "
+                   f"trading day its prices are MISSING; if it was an NSE holiday "
+                   f"there is nothing to fetch and this is harmless. Dates: "
                    f"{', '.join(throttled_days[:20])}"
                    f"{' …' if len(throttled_days) > 20 else ''}. "
-                   f"Re-run the same date range to fill them; days already stored are "
-                   f"skipped automatically.")
+                   f"Re-run the same date range to settle it; days already stored are "
+                   f"skipped automatically, and a holiday will simply 404 again.")
             print(f"\nWARNING: {msg}")
             with conn.cursor() as cur:
                 cur.execute(
