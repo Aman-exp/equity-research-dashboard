@@ -1,14 +1,16 @@
 import { useEffect, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { supabase, isConfigured } from './lib/supabase.js'
+import { useFreshness, usePendingActions } from './lib/queries.js'
 import Dashboard from './pages/Dashboard.jsx'
 import Company from './pages/Company.jsx'
+import Review from './pages/Review.jsx'
 import Login from './pages/Login.jsx'
 
-// Two views, so state routing rather than a router dependency.
+// Three views, so state routing rather than a router dependency.
 // "Prefer small and boring" — add react-router when there is a real need.
 export default function App() {
-  const [isin, setIsin] = useState(null)
+  const [route, setRoute] = useState({ name: 'dashboard' })
   // undefined = still checking localStorage for a saved session; null = signed out.
   // The distinction avoids a login-page flash on every reload for a signed-in user.
   const [session, setSession] = useState(undefined)
@@ -28,7 +30,7 @@ export default function App() {
     // Drop everything cached in memory — prices, fundamentals, theses — so
     // nothing lingers after sign-out on a shared machine.
     queryClient.clear()
-    setIsin(null)
+    setRoute({ name: 'dashboard' })
   }
 
   if (!isConfigured) return <SetupNeeded />
@@ -46,34 +48,63 @@ export default function App() {
       <header className="border-b border-slate-200 dark:border-slate-800">
         <div className="mx-auto flex max-w-5xl items-center gap-3 px-4 py-3">
           <button
-            onClick={() => setIsin(null)}
+            onClick={() => setRoute({ name: 'dashboard' })}
             className="text-sm font-semibold tracking-tight hover:opacity-70"
           >
             Equity Research
           </button>
-          {isin && (
-            <>
-              <span className="text-slate-400">/</span>
-              <span className="text-sm text-slate-500 dark:text-slate-400">company</span>
-            </>
-          )}
-          <button
-            onClick={signOut}
-            className="ml-auto text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300"
-          >
-            Sign out
-          </button>
+
+          <nav className="ml-auto flex items-center gap-4">
+            <ReviewLink route={route} setRoute={setRoute} />
+            <button
+              onClick={signOut}
+              className="text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300"
+            >
+              Sign out
+            </button>
+          </nav>
         </div>
       </header>
 
       <main className="mx-auto max-w-5xl px-4 py-6">
-        {isin ? (
-          <Company isin={isin} onBack={() => setIsin(null)} />
+        {route.name === 'company' ? (
+          <Company isin={route.isin} onBack={() => setRoute({ name: 'dashboard' })} />
+        ) : route.name === 'review' ? (
+          <Review />
         ) : (
-          <Dashboard onOpen={setIsin} />
+          <Dashboard
+            onOpen={(isin) => setRoute({ name: 'company', isin })}
+            onReview={() => setRoute({ name: 'review' })}
+          />
         )}
       </main>
     </div>
+  )
+}
+
+/** Pending-item counter, per the requirements doc's "badge for pending items". */
+function ReviewLink({ route, setRoute }) {
+  const freshness = useFreshness()
+  const actions = usePendingActions()
+  const pending =
+    Number(freshness.data?.[0]?.unverified_rows ?? 0) + (actions.data?.length ?? 0)
+
+  return (
+    <button
+      onClick={() => setRoute({ name: 'review' })}
+      className={`flex items-center gap-1.5 text-xs ${
+        route.name === 'review'
+          ? 'font-medium text-slate-900 dark:text-slate-100'
+          : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'
+      }`}
+    >
+      Review
+      {pending > 0 && (
+        <span className="rounded-full bg-amber-500 px-1.5 py-0.5 text-[10px] font-semibold text-white tnum">
+          {pending}
+        </span>
+      )}
+    </button>
   )
 }
 

@@ -22,6 +22,20 @@ export const inr = (n, opts = {}) =>
         ...opts,
       }).format(Number(n))
 
+/**
+ * Rupees in crore — how Indian financial statements are actually read.
+ * Raw XBRL values are absolute rupees (₹1,331,103,600,000), which is unreadable
+ * at a glance; ₹1,33,110 Cr is not.
+ */
+export const crore = (n) => {
+  if (n === null || n === undefined || Number.isNaN(Number(n))) return '—'
+  const cr = Number(n) / 1e7
+  return `₹${new Intl.NumberFormat('en-IN', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: Math.abs(cr) < 100 ? 1 : 0,
+  }).format(cr)} Cr`
+}
+
 export const num = (n, dp = 2) =>
   n === null || n === undefined || Number.isNaN(Number(n))
     ? '—'

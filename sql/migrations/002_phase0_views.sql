@@ -77,7 +77,11 @@ SELECT
   ca.ex_date,
   ca.entry_mode,
   ca_factor(ca.action_type, ca.ratio_from, ca.ratio_to) AS would_apply_factor,
-  EXISTS (SELECT 1 FROM transactions t WHERE t.isin = ca.isin) AS affects_a_position
+  EXISTS (SELECT 1 FROM transactions t WHERE t.isin = ca.isin) AS affects_a_position,
+  -- Appended last on purpose: CREATE OR REPLACE VIEW can add columns only at the
+  -- end, so this stays re-runnable against a live database without a DROP.
+  ca.id,
+  ca.source_url
 FROM corporate_actions ca
 JOIN companies c ON c.isin = ca.isin
 WHERE ca.status = 'unverified'

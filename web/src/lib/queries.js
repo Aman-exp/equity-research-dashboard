@@ -104,3 +104,54 @@ export const useAddConviction = () => {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['convictions'] }),
   })
 }
+
+// ---------------------------------------------------------------------------
+// Review inbox
+//
+// Auto-ingested rows land as `unverified` and are deliberately inert until
+// confirmed: adj_factor() ignores unverified corporate actions, and the UI flags
+// unverified fundamentals. Confirming is the one action that makes staged data
+// count, so it belongs in the app rather than in raw SQL.
+// ---------------------------------------------------------------------------
+
+/** Every fundamentals row, so the inbox can show quarter-on-quarter context. */
+export const useAllFundamentals = () =>
+  useQuery({
+    queryKey: ['all_fundamentals'],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from('fundamentals_quarterly')
+        .select('*, companies(company_name, symbol_nse)')
+        .order('period_end', { ascending: false })
+      if (error) throw new Error(error.message)
+      return data
+    },
+  })
+
+const confirmRows = (table) => async (ids) => {
+  const { error } = await supabase
+    .from(table)
+    .update({ status: 'confirmed' })
+    .in('id', ids)
+  if (error) throw new Error(error.message)
+}
+
+export const useConfirmFundamentals = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: confirmRows('fundamentals_quarterly'),
+    // Confirming changes TTM EPS and therefore P/E, so refresh broadly rather
+    // than only the inbox.
+    onSuccess: () => qc.invalidateQueries(),
+  })
+}
+
+export const useConfirmCorporateActions = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: confirmRows('corporate_actions'),
+    // A confirmed split/bonus rescales quantities AND adjusted prices, so every
+    // derived number on the dashboard can move.
+    onSuccess: () => qc.invalidateQueries(),
+  })
+}

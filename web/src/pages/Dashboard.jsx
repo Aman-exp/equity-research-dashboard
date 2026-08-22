@@ -4,7 +4,7 @@ import {
 } from '../lib/queries.js'
 import { inr, num, daysSince } from '../lib/supabase.js'
 
-export default function Dashboard({ onOpen }) {
+export default function Dashboard({ onOpen, onReview }) {
   const freshness = useFreshness()
   const failures = useJobFailures()
   const pending = usePendingActions()
@@ -49,6 +49,14 @@ export default function Dashboard({ onOpen }) {
               </li>
             ))}
           </ul>
+          {onReview && (
+            <button
+              onClick={onReview}
+              className="mt-2 rounded-lg bg-amber-900 px-3 py-1.5 text-xs font-medium text-white dark:bg-amber-200 dark:text-amber-950"
+            >
+              Review and confirm
+            </button>
+          )}
         </Banner>
       )}
 
