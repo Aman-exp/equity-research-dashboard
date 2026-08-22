@@ -238,7 +238,36 @@ def main():
                 if prev is None or (r.get("broadcast_Date") or "") > (prev.get("broadcast_Date") or ""):
                     latest[key] = r
 
-            for r in latest.values():
+            # ONE BASIS PER QUARTER: consolidated where available, standalone
+            # only as a fallback. This is the convention the build spec settled
+            # on (§14) and it was not being applied — every quarter was staged
+            # twice.
+            #
+            # Measured 2026-08-22: all 5 watchlist companies file BOTH bases for
+            # every quarter, so staging both exactly doubled the review queue
+            # (58 rows where 29 were meaningful) with no added information. Worse
+            # than redundant for a holding company: L&T's Sep-2025 STANDALONE PAT
+            # is -3,591 Cr, entirely a one-off exceptional item, which drags its
+            # standalone TTM P/E to 77.6 against a consolidated 33.9. Asking the
+            # user to review that row invites confirming a number that should
+            # never drive a decision.
+            #
+            # A company reporting no consolidated figures still gets its
+            # standalone row, so nothing is lost; manual entry remains available
+            # for the rare case where the other basis is genuinely wanted.
+            by_quarter = {}
+            for (qe_date, basis), r in latest.items():
+                b = (basis or "").strip().lower()
+                held = by_quarter.get(qe_date)
+                if held is None or (held[0] != "consolidated" and b == "consolidated"):
+                    by_quarter[qe_date] = (b, r)
+
+            dropped = len(latest) - len(by_quarter)
+            if dropped:
+                print(f"  {symbol}: {dropped} redundant standalone filing(s) not staged "
+                      f"(consolidated available)")
+
+            for _basis, r in by_quarter.values():
                 xbrl_url = r["xbrl"]
                 filing_type = r["consolidated"].strip().lower()   # consolidated|standalone
                 qe = datetime.strptime(r["qe_Date"].strip().title(), "%d-%b-%Y").date()

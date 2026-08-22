@@ -260,7 +260,7 @@ def main():
             return
 
         queued = skipped = discarded = 0
-        drift_alerts = []
+        unknown_drift = set()
 
         for symbol, isin in targets:
             rows = parse_rows(fetch(API.format(symbol=symbol, frm=frm, to=to)))
@@ -275,9 +275,16 @@ def main():
 
                 # Read the feed's ISIN ONLY to detect drift. It is never used to
                 # resolve the company — see the module docstring.
+                #
+                # A mismatch that isin_aliases ALREADY EXPLAINS is not news: the
+                # feed reports superseded ISINs for HDFCBANK and SUNPHARMA on
+                # every single row, forever. Alerting on those would put a
+                # permanent, unfixable red banner on the dashboard — the precise
+                # habit that teaches you to stop reading the banner. Resolved
+                # below against the alias table; only UNKNOWN drift alerts.
                 feed_isin = (r.get("sm_isin") or "").strip()
                 if feed_isin and feed_isin != isin:
-                    drift_alerts.append((symbol, isin, feed_isin))
+                    unknown_drift.add((symbol, isin, feed_isin))
 
                 seq = r.get("seq_id")
                 batch.append((
@@ -324,17 +331,24 @@ def main():
             time.sleep(1.5)          # be polite between symbols
 
         # Drift is an ALERT, never an auto-migration: renaming an ISIN cascades
-        # across every table, and a false positive would merge two securities.
-        # Deduped by message so a daily job cannot spam the banner into
-        # irrelevance (the lesson fetch_fundamentals.py already learned).
-        if drift_alerts:
+        # across every table, and a false positive would silently merge two
+        # securities. But only genuinely UNKNOWN drift is worth saying out loud —
+        # a mismatch the alias table already accounts for is a documented fact
+        # about NSE, not an incident.
+        if unknown_drift:
             with conn.cursor() as cur:
-                for symbol, stored, feed_isin in sorted(set(drift_alerts)):
+                for symbol, stored, feed_isin in sorted(unknown_drift):
+                    cur.execute("SELECT resolve_isin(%s)", (feed_isin,))
+                    if cur.fetchone()[0] == stored:
+                        continue          # already recorded in isin_aliases — expected
                     msg = (f"{symbol}: announcements feed reports ISIN {feed_isin}, "
-                           f"companies has {stored}. This is EXPECTED for HDFCBANK and "
-                           f"SUNPHARMA (the feed is stale); investigate only if the "
-                           f"symbol is new. Matching is by symbol, so ingestion is "
-                           f"unaffected. See docs/design-corporate-identity.md")
+                           f"companies has {stored}, and no isin_aliases row explains "
+                           f"the difference. Ingestion is UNAFFECTED (matching is by "
+                           f"symbol), but confirm against the bhavcopy — if the ISIN "
+                           f"really changed, follow the rename procedure in "
+                           f"docs/design-corporate-identity.md.")
+                    # Deduped by exact message, so a daily job cannot spam the
+                    # banner into irrelevance.
                     cur.execute(
                         "SELECT 1 FROM job_failures WHERE job_name=%s AND error_text=%s",
                         (JOB_NAME, msg))
@@ -342,6 +356,7 @@ def main():
                         cur.execute(
                             "INSERT INTO job_failures (job_name, error_text) VALUES (%s,%s)",
                             (JOB_NAME, msg))
+                        print(f"  ALERT: unexplained ISIN drift for {symbol}")
             conn.commit()
 
         with conn.cursor() as cur:
