@@ -1,0 +1,63 @@
+name: Announcement feed diff
+
+# The daily loop. Polls NSE's corporate-announcements feed for each active
+# watchlist company and queues what is worth a human look into filings_queue.
+# The build spec (Section 8, job 2) calls this "the entire tell-me-what-to-do-
+# today feature" — without it the dashboard only changes once a quarter.
+#
+# Routing is deterministic keyword matching on NSE's own category string. No
+# inference, no model, no recurring cost.
+#
+# 21:00 IST, after the EOD (19:00) and fundamentals (20:30) jobs, so the queue is
+# fresh by morning. Runs EVERY day, not weekdays only: announcements are filed on
+# non-trading days too (board meetings, rating actions, order wins).
+#
+# The default 7-day lookback is deliberate resilience — if this job fails for a
+# few days, the next successful run backfills the gap on its own. Re-ingestion is
+# free because NSE's seq_id is stored as external_ref under a unique index.
+#
+# Required secret: SUPABASE_DB_URL — session pooler string, port 5432 (the
+# direct connection is IPv6-only on the free tier; runners are IPv4-only).
+
+on:
+  schedule:
+    - cron: '0 21 * * *'
+      timezone: 'Asia/Kolkata'
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: 'Days to look back (default 7; use ~90 for a first backfill)'
+        required: false
+
+concurrency:
+  group: announcements
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Poll announcement feed
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: python scripts/fetch_announcements.py ${{ inputs.lookback_days }}
+
+# Failure paths surface on the dashboard banner via job_failures:
+#   - a whole-job exception (network, DB, unparseable feed)
+#   - a WAF challenge page served as HTTP 200 with HTML instead of JSON, which
+#     would otherwise look like a healthy run that ingested nothing
+#   - ISIN drift between the feed and `companies` (deduped by message, because a
+#     daily job re-alerting daily would train the user to ignore the banner)
+#
+# Note the feed is EXPECTED to report stale ISINs for HDFCBANK and SUNPHARMA.
+# The script matches on symbol, never on the feed's ISIN, so ingestion is
+# unaffected — see the module docstring in scripts/fetch_announcements.py.

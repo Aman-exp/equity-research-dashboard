@@ -40,6 +40,37 @@ export const useAcknowledgeFailures = () => {
   })
 }
 
+// ---------------------------------------------------------------------------
+// Task queue — "what should I look at today".
+//
+// Populated by the announcement-feed job. This is the only part of the app that
+// changes on an ordinary weekday, so it is the reason to open the dashboard at
+// all; everything else moves quarterly.
+// ---------------------------------------------------------------------------
+
+export const useTaskQueue = () =>
+  useQuery({ queryKey: ['task_queue'], queryFn: from('v_task_queue') })
+
+/**
+ * Clear an item. 'processed' means acted on; 'dismissed' means consciously
+ * skipped — deliberately different claims, because a queue you can only empty
+ * by pretending you did the work is a queue you learn to ignore. The DB trigger
+ * stamps processed_at either way.
+ */
+export const useUpdateTask = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ ids, status }) => {
+      const { error } = await supabase
+        .from('filings_queue')
+        .update({ status })
+        .in('id', ids)
+      if (error) throw new Error(error.message)
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['task_queue'] }),
+  })
+}
+
 export const usePendingActions = () =>
   useQuery({
     queryKey: ['pending_actions'],
