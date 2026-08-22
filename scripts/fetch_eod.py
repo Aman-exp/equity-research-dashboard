@@ -92,13 +92,27 @@ def parse_bhavcopy(blob, wanted_isins):
         name = z.namelist()[0]
         text = z.read(name).decode("utf-8", errors="replace")
 
-    out, symbols = {}, {}
+    out, symbols, catalogue = {}, {}, {}
     for row in csv.DictReader(io.StringIO(text)):
         isin = (row.get("ISIN") or "").strip()
         if not isin:
             continue
         series = (row.get("SctySrs") or "").strip()
         symbols[isin] = (row.get("TckrSymb") or "").strip()
+
+        # Equity catalogue for the add-to-watchlist search (nse_securities).
+        # Series EQ + an 'INE' ISIN is what makes something an actual equity
+        # share: the same series also carries ~347 'INF' rows, which are ETF and
+        # mutual-fund units and would only clutter an equity research tool.
+        # The bhavcopy is the ONLY place a current ISIN may come from — see the
+        # module docstring and docs/design-corporate-identity.md.
+        if series == "EQ" and isin.startswith("INE"):
+            catalogue[isin] = (
+                isin,
+                (row.get("TckrSymb") or "").strip(),
+                (row.get("FinInstrmNm") or "").strip() or None,
+            )
+
         if isin not in wanted_isins:
             continue
         # A stock can appear in more than one series; prefer EQ.
@@ -117,7 +131,40 @@ def parse_bhavcopy(blob, wanted_isins):
             num("OpnPric"), num("HghPric"), num("LwPric"), num("ClsPric"),
             int(Decimal(vol)) if vol else None,
         )
-    return list(out.values()), symbols
+    return list(out.values()), symbols, list(catalogue.values())
+
+
+def upsert_securities(conn, catalogue, on_date):
+    """
+    Refresh the equity catalogue used by the add-to-watchlist search.
+
+    ISOLATED FROM PRICE INGESTION ON PURPOSE. Prices are load-bearing; this
+    lookup table is a convenience. If it fails — most plausibly because migration
+    007 has not been applied yet on a partial deploy — the price job must still
+    succeed, so this swallows its own error, warns, and returns. It gets its own
+    transaction for the same reason: a failure here must not roll back the day's
+    prices.
+    """
+    if not catalogue:
+        return 0
+    try:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(cur, """
+                INSERT INTO nse_securities (isin, symbol, name, last_seen)
+                VALUES %s
+                ON CONFLICT (isin) DO UPDATE SET
+                  symbol     = EXCLUDED.symbol,
+                  name       = COALESCE(EXCLUDED.name, nse_securities.name),
+                  last_seen  = GREATEST(nse_securities.last_seen, EXCLUDED.last_seen),
+                  updated_at = now()
+            """, [(i, s, n, on_date) for i, s, n in catalogue])
+        conn.commit()
+        return len(catalogue)
+    except Exception as exc:                        # noqa: BLE001 - never break prices
+        conn.rollback()
+        print(f"  warning: could not refresh nse_securities ({type(exc).__name__}: {exc}). "
+              f"Prices are unaffected; apply sql/migrations/007_nse_securities.sql.")
+        return 0
 
 
 def parse_indices(blob, on_date):
@@ -192,7 +239,7 @@ def main():
             stamp_p = day.strftime("%Y%m%d")
             stamp_i = day.strftime("%d%m%Y")
             try:
-                prices, symbols = parse_bhavcopy(
+                prices, symbols, catalogue = parse_bhavcopy(
                     fetch(BHAVCOPY_URL.format(yyyymmdd=stamp_p)), wanted)
             except NotPublished:
                 # Holiday / weekend / not yet published. Normal, not an error.
@@ -232,9 +279,20 @@ def main():
                         ("isin_drift", msg))
 
             conn.commit()
+
+            # After the prices are safely committed, never before: the catalogue
+            # is a convenience and must not put the day's prices at risk.
+            # Only on the most recent day of a backfill — the catalogue is a
+            # current snapshot, not a time series, and rewriting it once per
+            # backfilled day would be 2,285 pointless upserts each time.
+            n_cat = 0
+            if day == end:
+                n_cat = upsert_securities(conn, catalogue, day)
+
             total_prices += len(prices)
             total_idx += len(indices)
-            print(f"  {day}: {len(prices)} prices, {len(indices)} indices")
+            print(f"  {day}: {len(prices)} prices, {len(indices)} indices"
+                  + (f", {n_cat} securities catalogued" if n_cat else ""))
             day += timedelta(days=1)
             if day <= end:
                 time.sleep(1)          # be polite on backfill runs

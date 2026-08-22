@@ -5,7 +5,7 @@ import {
 } from '../lib/queries.js'
 import { inr, num, daysSince, tradingDaysSince, istDate } from '../lib/supabase.js'
 
-export default function Dashboard({ onOpen, onReview }) {
+export default function Dashboard({ onOpen, onReview, onManageWatchlist }) {
   const freshness = useFreshness()
   const failures = useJobFailures()
   const ack = useAcknowledgeFailures()
@@ -114,9 +114,19 @@ export default function Dashboard({ onOpen, onReview }) {
       <Portfolio query={portfolio} />
 
       <section>
-        <h2 className="mb-2 text-sm font-semibold text-slate-600 dark:text-slate-300">
-          Watchlist
-        </h2>
+        <div className="mb-2 flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-slate-600 dark:text-slate-300">
+            Watchlist
+          </h2>
+          {onManageWatchlist && (
+            <button
+              onClick={onManageWatchlist}
+              className="text-xs text-slate-500 hover:text-slate-800 hover:underline dark:hover:text-slate-200"
+            >
+              Manage
+            </button>
+          )}
+        </div>
         <QueryState query={watchlist} empty="No companies on the watchlist.">
           <div className="overflow-hidden rounded-xl border border-slate-200 dark:border-slate-800">
             <table className="w-full text-sm">

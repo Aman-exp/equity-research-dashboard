@@ -5,9 +5,10 @@ import { useFreshness, usePendingActions } from './lib/queries.js'
 import Dashboard from './pages/Dashboard.jsx'
 import Company from './pages/Company.jsx'
 import Review from './pages/Review.jsx'
+import Watchlist from './pages/Watchlist.jsx'
 import Login from './pages/Login.jsx'
 
-// Three views, so state routing rather than a router dependency.
+// A handful of views, so state routing rather than a router dependency.
 // "Prefer small and boring" — add react-router when there is a real need.
 export default function App() {
   const [route, setRoute] = useState({ name: 'dashboard' })
@@ -71,10 +72,16 @@ export default function App() {
           <Company isin={route.isin} onBack={() => setRoute({ name: 'dashboard' })} />
         ) : route.name === 'review' ? (
           <Review />
+        ) : route.name === 'watchlist' ? (
+          <Watchlist
+            onBack={() => setRoute({ name: 'dashboard' })}
+            onOpen={(isin) => setRoute({ name: 'company', isin })}
+          />
         ) : (
           <Dashboard
             onOpen={(isin) => setRoute({ name: 'company', isin })}
             onReview={() => setRoute({ name: 'review' })}
+            onManageWatchlist={() => setRoute({ name: 'watchlist' })}
           />
         )}
       </main>

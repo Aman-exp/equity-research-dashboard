@@ -41,6 +41,108 @@ export const useAcknowledgeFailures = () => {
 }
 
 // ---------------------------------------------------------------------------
+// Watchlist management.
+//
+// Adding a company needs its ISIN, and the project's hardest rule is that ISINs
+// come from the bhavcopy — never a filings API, which reports the ISIN as of
+// filing time and goes stale. The browser cannot enforce that itself (the
+// bhavcopy is a zipped CSV on a host with no CORS headers), so the EOD job
+// maintains `nse_securities` from it daily and the UI searches that. The ISIN
+// written here is therefore authoritative by construction, and the user never
+// types one.
+// ---------------------------------------------------------------------------
+
+export const useWatchlistDetail = () =>
+  useQuery({ queryKey: ['watchlist_detail'], queryFn: from('v_watchlist_detail') })
+
+/**
+ * Search the equity catalogue by symbol or name.
+ *
+ * Two plain .ilike() queries merged here, rather than one .or() filter string.
+ * PostgREST's or= syntax parses the filter out of a comma-separated string, so
+ * wildcards and punctuation inside a user-typed term change its meaning, and the
+ * failure mode is a silently empty result rather than an error. Two unambiguous
+ * single-column queries cost one extra round trip against a 2,285-row table and
+ * cannot be broken by whatever the user types.
+ */
+export const useSecuritySearch = (term) => {
+  const q = (term ?? '').trim()
+  return useQuery({
+    queryKey: ['security_search', q],
+    enabled: q.length >= 2,
+    queryFn: async () => {
+      const cols = 'isin, symbol, name, last_seen'
+      const [bySymbol, byName] = await Promise.all([
+        supabase.from('nse_securities').select(cols)
+          .ilike('symbol', `${q}%`).order('symbol').limit(15),
+        supabase.from('nse_securities').select(cols)
+          .ilike('name', `%${q}%`).order('symbol').limit(15),
+      ])
+      if (bySymbol.error) throw new Error(bySymbol.error.message)
+      if (byName.error) throw new Error(byName.error.message)
+
+      // Symbol matches first — typing "TATA" should surface TATACHEM before a
+      // company that merely mentions Tata in its name.
+      const seen = new Set()
+      const merged = []
+      for (const r of [...(bySymbol.data ?? []), ...(byName.data ?? [])]) {
+        if (seen.has(r.isin)) continue
+        seen.add(r.isin)
+        merged.push(r)
+      }
+      return merged.slice(0, 15)
+    },
+  })
+}
+
+export const useAddToWatchlist = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (security) => {
+      // ignoreDuplicates: a company already known (perhaps removed from the
+      // watchlist earlier, with sector and notes curated by hand) must not have
+      // that overwritten by the bhavcopy's terse uppercase name.
+      const { error: cErr } = await supabase
+        .from('companies')
+        .upsert(
+          {
+            isin: security.isin,
+            symbol_nse: security.symbol,
+            company_name: security.name || security.symbol,
+          },
+          { onConflict: 'isin', ignoreDuplicates: true },
+        )
+      if (cErr) throw new Error(`companies: ${cErr.message}`)
+
+      // This one DOES overwrite, so re-adding a previously removed company
+      // reactivates it rather than failing on the primary key.
+      const { error: wErr } = await supabase
+        .from('watchlist')
+        .upsert({ isin: security.isin, active: true }, { onConflict: 'isin' })
+      if (wErr) throw new Error(`watchlist: ${wErr.message}`)
+    },
+    onSuccess: () => qc.invalidateQueries(),
+  })
+}
+
+/**
+ * Deactivate rather than delete. price_history, fundamentals and any conviction
+ * entries reference the company, and dropping the row would either fail on the
+ * foreign key or discard research. `active = false` stops the jobs fetching it
+ * while every past record survives — and re-adding later resumes it intact.
+ */
+export const useSetWatchlistActive = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ isin, active }) => {
+      const { error } = await supabase.from('watchlist').update({ active }).eq('isin', isin)
+      if (error) throw new Error(error.message)
+    },
+    onSuccess: () => qc.invalidateQueries(),
+  })
+}
+
+// ---------------------------------------------------------------------------
 // Task queue — "what should I look at today".
 //
 // Populated by the announcement-feed job. This is the only part of the app that
