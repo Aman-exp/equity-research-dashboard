@@ -64,19 +64,36 @@ RE_FV_SPLIT = re.compile(
 RE_INTERESTING = re.compile(r"bonus|split|sub-division|consolidat|rights", re.I)
 
 
+def looks_like_html(blob):
+    head = blob[:512].lstrip()[:64].lower()
+    return head.startswith(b"<!doctype") or head.startswith(b"<html") or b"<head" in head
+
+
 def fetch(url, retries=4):
+    """
+    GET + JSON decode with exponential backoff.
+
+    HTTP 200 is not proof of content: NSE's WAF answers a rate-limited request
+    with an HTML page and a 200. Detecting it explicitly (rather than letting
+    json.loads fail with a cryptic decode error) makes the retry intentional and
+    the eventual message diagnosable.
+    """
     delay = 2
     last = None
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers=HEADERS)
             with urllib.request.urlopen(req, timeout=60) as r:
-                return json.loads(r.read().decode("utf-8", errors="replace"))
+                blob = r.read()
+            if looks_like_html(blob):
+                last = "server returned an HTML page (rate limited?)"
+            else:
+                return json.loads(blob.decode("utf-8", errors="replace"))
         except Exception as e:                      # noqa: BLE001 - retry transient
             last = e
         if attempt < retries - 1:
             time.sleep(delay)
-            delay *= 2
+            delay *= 2                              # 2s, 4s, 8s — let the WAF cool off
     raise RuntimeError(f"failed after {retries} attempts: {url} ({last})")
 
 
@@ -125,8 +142,19 @@ def main():
             targets = cur.fetchall()
 
         inserted = unparsed = 0
+        # Symbols skipped due to rate limiting; retried next weekly run.
+        deferred = []
         for isin, symbol in targets:
-            rows = fetch(API.format(symbol=symbol))
+            # One symbol failing must not cost the rest. Corporate actions are
+            # rare and this job runs weekly, so a symbol missed now is picked up
+            # next Saturday well before any ex-date — reported, not alerted.
+            try:
+                rows = fetch(API.format(symbol=symbol))
+            except RuntimeError as exc:
+                print(f"  ! {symbol}: could not fetch — {exc}")
+                deferred.append(symbol)
+                time.sleep(3)
+                continue
             found = []
             for r in rows:
                 subject = (r.get("subject") or "").strip()

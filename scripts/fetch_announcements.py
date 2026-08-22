@@ -166,20 +166,35 @@ class FeedError(Exception):
     """Feed returned something unusable — surfaced, never swallowed."""
 
 
+def looks_like_html(blob):
+    head = blob[:512].lstrip()[:64].lower()
+    return head.startswith(b"<!doctype") or head.startswith(b"<html") or b"<head" in head
+
+
 def fetch(url, retries=4):
-    """GET with exponential backoff. Polite to NSE: no tight loops."""
+    """
+    GET with exponential backoff. Polite to NSE: no tight loops.
+
+    HTTP 200 is not proof of content: NSE's WAF answers a rate-limited request
+    with an HTML page and a 200. Detecting that here means it is RETRIED (usually
+    enough) rather than surfacing later as a confusing parse error.
+    """
     delay = 2
     last = None
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers=HEADERS)
             with urllib.request.urlopen(req, timeout=60) as r:
-                return r.read()
+                blob = r.read()
+            if looks_like_html(blob):
+                last = "server returned an HTML page (rate limited?)"
+            else:
+                return blob
         except Exception as e:                      # noqa: BLE001 - retry transient
             last = e
         if attempt < retries - 1:
             time.sleep(delay)
-            delay *= 2
+            delay *= 2                              # 2s, 4s, 8s — let the WAF cool off
     raise FeedError(f"failed after {retries} attempts: {last}")
 
 
@@ -261,9 +276,22 @@ def main():
 
         queued = skipped = discarded = 0
         unknown_drift = set()
+        # Symbols skipped this run due to rate limiting. Self-healing:
+        # the 7-day lookback means the next run re-covers the window.
+        deferred = []
 
         for symbol, isin in targets:
-            rows = parse_rows(fetch(API.format(symbol=symbol, frm=frm, to=to)))
+            # One symbol failing must not cost the other four. Most likely cause
+            # is rate limiting while an EOD backfill is running; the 7-day
+            # lookback means the next run recovers anything missed here on its
+            # own, so this is reported rather than alerted.
+            try:
+                rows = parse_rows(fetch(API.format(symbol=symbol, frm=frm, to=to)))
+            except FeedError as exc:
+                print(f"  ! {symbol}: {exc}")
+                deferred.append(symbol)
+                time.sleep(3)
+                continue
             print(f"  {symbol}: {len(rows)} announcement(s) in the window")
 
             batch = []

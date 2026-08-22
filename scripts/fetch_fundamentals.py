@@ -92,6 +92,24 @@ class Missing(Exception):
     (Sun Pharma, Jul-2025 filing): alert and continue, never abort the job."""
 
 
+class Throttled(Exception):
+    """
+    NSE answered with a web page instead of the file.
+
+    Kept distinct from Missing on purpose. Missing means the filing genuinely is
+    not on the archive and never will be — worth a one-off alert telling you to
+    enter it by hand. Throttled means the filing EXISTS and we were rate-limited;
+    the right response is to retry later, not to record it as permanently absent.
+    Conflating them would either spam the banner with transient failures or
+    quietly mark real filings as unavailable.
+    """
+
+
+def looks_like_html(blob):
+    head = blob[:512].lstrip()[:64].lower()
+    return head.startswith(b"<!doctype") or head.startswith(b"<html") or b"<head" in head
+
+
 def fetch(url, retries=4):
     delay = 2
     last = None
@@ -99,7 +117,15 @@ def fetch(url, retries=4):
         try:
             req = urllib.request.Request(url, headers=HEADERS)
             with urllib.request.urlopen(req, timeout=60) as r:
-                return r.read()
+                blob = r.read()
+            # HTTP 200 is not proof of content. Observed 2026-08-22: while an EOD
+            # backfill was running, NSE's WAF answered XBRL requests with an HTML
+            # page and a 200, and ET.fromstring died on "mismatched tag" — an
+            # error that says nothing about the real cause. Validate what arrived.
+            if looks_like_html(blob):
+                last = Throttled("server returned an HTML page instead of the file")
+            else:
+                return blob
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 raise Missing(url)
@@ -108,7 +134,9 @@ def fetch(url, retries=4):
             last = e
         if attempt < retries - 1:
             time.sleep(delay)
-            delay *= 2
+            delay *= 2                              # 2s, 4s, 8s — let the WAF cool off
+    if isinstance(last, Throttled):
+        raise Throttled(f"{url}: {last}")
     raise RuntimeError(f"failed after {retries} attempts: {url} ({last})")
 
 
@@ -223,8 +251,24 @@ def main():
             targets = cur.fetchall()
 
         staged = updated = skipped = alerts = 0
+        # Filings we could not fetch because of rate limiting. Distinct from
+        # `alerts`: these are transient and self-healing on the next run, so they
+        # get one summary line rather than a durable per-filing banner row.
+        deferred = []
         for symbol, company_isin in targets:
-            rows = json.loads(fetch(API.format(symbol=symbol)).decode("utf-8", "replace"))
+            # HEAD-OF-LINE BLOCKING FIX. This call used to sit outside any
+            # handler, so a single symbol failing — a rename, a delisting, or
+            # simply being throttled — aborted the entire run and the four
+            # companies after it were never polled. Record and move on instead.
+            try:
+                payload = fetch(API.format(symbol=symbol))
+                rows = json.loads(payload.decode("utf-8", "replace"))
+            except (Throttled, Missing, RuntimeError, json.JSONDecodeError) as exc:
+                print(f"  ! {symbol}: could not fetch the filing index — {exc}")
+                deferred.append(f"{symbol} (filing index)")
+                time.sleep(3)                       # back off before the next symbol
+                continue
+
             rows = [r for r in (rows.get("data") or [])
                     if r.get("type") == "Integrated Filing- Financials"
                     and r.get("xbrl") and r.get("consolidated")]
@@ -285,6 +329,33 @@ def main():
                 is_banking = "BANKING" in xbrl_url.upper()
                 try:
                     parsed = parse_xbrl(fetch(xbrl_url), is_banking)
+                except Throttled as exc:
+                    # Transient: the filing exists, we were rate-limited. Defer
+                    # to the next run rather than recording it as missing —
+                    # tomorrow's run picks it up because nothing was stored.
+                    print(f"  ~ {symbol} {r['qe_Date']} {filing_type}: throttled, "
+                          f"will retry next run")
+                    deferred.append(f"{symbol} {r['qe_Date']} {filing_type}")
+                    time.sleep(5)
+                    continue
+                except ET.ParseError as exc:
+                    # Reached only when the payload is neither HTML nor valid XML
+                    # — a genuinely malformed filing. Worth a durable alert,
+                    # deduped, because re-parsing it tomorrow will fail the same
+                    # way and only a human can resolve it.
+                    msg = (f"{symbol} {r['qe_Date']} {filing_type}: XBRL is not "
+                           f"parseable ({exc}). Enter manually if needed: {xbrl_url}")
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT 1 FROM job_failures WHERE job_name=%s AND error_text=%s",
+                            (JOB_NAME, msg))
+                        if not cur.fetchone():
+                            cur.execute(
+                                "INSERT INTO job_failures (job_name, error_text) VALUES (%s,%s)",
+                                (JOB_NAME, msg))
+                            alerts += 1
+                            print(f"  ! {symbol} {r['qe_Date']}: unparseable XBRL — alert raised")
+                    continue
                 except Missing:
                     msg = (f"{symbol} {r['qe_Date']} {filing_type}: XBRL file missing "
                            f"on archive host (404) — enter manually if needed: {xbrl_url}")
@@ -373,6 +444,18 @@ def main():
               f"{alerts} alert(s)")
         if staged:
             print("New rows are UNVERIFIED and flagged on the dashboard until confirmed.")
+
+        # Rate-limited filings are reported but NOT written to job_failures: the
+        # next scheduled run retries them automatically (nothing was stored, so
+        # the already-present check does not skip them), and a self-healing
+        # condition does not deserve a banner the user has to dismiss. It only
+        # becomes an alert if it persists — which shows up as a filing that never
+        # arrives, visible in the review inbox staying empty after results day.
+        if deferred:
+            print(f"\n{len(deferred)} filing(s) deferred to the next run (rate limited): "
+                  f"{', '.join(deferred[:10])}{' …' if len(deferred) > 10 else ''}")
+            print("This is normal while an EOD backfill is running — both jobs share "
+                  "NSE's rate limit. No action needed unless it repeats for days.")
 
     except Exception as exc:                        # noqa: BLE001 - must always alert
         conn.rollback()

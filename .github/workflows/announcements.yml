@@ -30,7 +30,19 @@ on:
         required: false
 
 concurrency:
-  group: announcements
+  # SHARED ACROSS ALL FOUR NSE-TOUCHING WORKFLOWS. NSE rate-limits by source, and
+  # GitHub runners are datacenter IPs, so two of these jobs running at once
+  # throttle each other — observed 2026-08-22, when an EOD backfill and the XBRL
+  # job collided and NSE served HTML pages with HTTP 200 to both.
+  #
+  # cancel-in-progress: false, so a job WAITS rather than killing the one already
+  # talking to NSE. Note GitHub keeps only ONE pending run per group: if two runs
+  # queue behind a long backfill, the earlier pending one is cancelled. In normal
+  # operation the schedules are 90+ minutes apart and never collide, so this only
+  # matters during a manual backfill — run those outside 20:00-21:15 IST, or
+  # re-trigger anything the Actions tab shows as cancelled. Every job here is
+  # self-healing on the next run, so a skipped one loses nothing permanently.
+  group: nse-api
   cancel-in-progress: false
 
 jobs:
