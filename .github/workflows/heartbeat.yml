@@ -1,0 +1,154 @@
+name: Pipeline status + repo heartbeat
+
+# TWO JOBS IN ONE, deliberately.
+#
+# 1. PUBLISHES PIPELINE HEALTH to docs/pipeline-status.md — last price date,
+#    staleness, unverified backlog, open job failures. Readable straight from the
+#    repo (or a phone, on github.com) without signing into the dashboard, and its
+#    git history becomes an audit trail of data freshness over time.
+#
+# 2. KEEPS THIS REPO ACTIVE. In a PUBLIC repository — which this one is, so that
+#    GitHub Pages is free — GitHub disables scheduled workflows after 60 days
+#    with no repository activity. Nothing else here commits to THIS repo: the
+#    backup job pushes to the separate backups repo, which does not count, and
+#    deploy-pages only runs on a manual push. So without this, every scheduled
+#    job (prices, fundamentals, corporate actions, backup) silently stops ~60
+#    days after the last hand-made commit — exactly when the project is meant to
+#    be running unattended.
+#
+# WHY WEEKLY, AND WHY REAL CONTENT
+# --------------------------------
+# GitHub's Acceptable Use Policy prohibits "automated excessive bulk activity"
+# and gaming platform features. A daily no-op commit whose only purpose is to
+# reset a timer sits close to that line — the most popular third-party keepalive
+# action was disabled by GitHub for a ToS violation. This job stays clearly on
+# the right side of it: real content with independent value, at low volume.
+# Weekly still yields 8-9 activity events per 60-day window.
+#
+# GitHub does NOT publicly define what counts as "repository activity", so treat
+# this as prevention, not proof. DETECTION is the price-staleness banner on the
+# dashboard, which fires whenever data stops arriving regardless of the cause.
+# If GitHub emails you that scheduled workflows were disabled, just re-enable
+# them in the Actions tab.
+#
+# Writes to docs/ only, so it never triggers deploy-pages.yml (which filters on
+# web/**) — no rebuild, no Pages churn.
+#
+# Required secret: SUPABASE_DB_URL — session pooler string, port 5432.
+
+on:
+  schedule:
+    - cron: '0 9 * * 0'          # Sunday 09:00 IST, markets closed
+      timezone: 'Asia/Kolkata'
+  workflow_dispatch:
+
+concurrency:
+  group: heartbeat
+  cancel-in-progress: false
+
+permissions:
+  contents: write                # needed to push the status file back
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect pipeline status
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -uo pipefail
+          mkdir -p docs
+
+          # `|| true` is load-bearing. GitHub runs `run:` steps under `bash -e`,
+          # so without it a database outage would abort this step — and the half
+          # of this job that keeps the repo active must NOT depend on Supabase
+          # being up. The empty result is handled below instead.
+          #
+          # The URL is expanded by the RUNNER's shell before docker starts, not
+          # inside the container — same pattern as backup.yml's pg_dump step.
+          # (Passing it as `-e VAR` and then writing "$VAR" here would expand to
+          # empty, because the variable exists only inside the container.)
+          # Actions masks the secret in logs.
+          ROW=$(docker run --rm postgres:17-alpine \
+                  psql "$DB_URL" -X -A -t -F '|' -v ON_ERROR_STOP=1 -c "
+                    SELECT
+                      COALESCE((SELECT max(date)::text FROM price_history), 'none'),
+                      COALESCE((SELECT max(date)::text FROM index_history), 'none'),
+                      (SELECT count(*) FROM fundamentals_quarterly WHERE status='unverified'),
+                      (SELECT count(*) FROM corporate_actions     WHERE status='unverified'),
+                      (SELECT count(*) FROM job_failures          WHERE acknowledged_at IS NULL),
+                      (SELECT count(*) FROM companies),
+                      (SELECT count(*) FROM transactions),
+                      (SELECT count(*) FROM conviction_log);
+                  " 2>/dev/null | tr -d '\r' || true)
+
+          NOW=$(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M %Z')
+
+          if [ -z "$ROW" ]; then
+            echo "::warning::Could not reach the database — writing an unreachable status."
+            {
+              echo "# Pipeline status"
+              echo
+              echo "_Generated $NOW by \`heartbeat.yml\`._"
+              echo
+              echo '> **Database unreachable at last check.** Either Supabase is down/paused, or'
+              echo '> `SUPABASE_DB_URL` is no longer valid. Every scheduled job shares this secret,'
+              echo '> so if this persists, all of them are failing — and a failing job cannot write'
+              echo '> its own alert row. Check the Actions tab.'
+            } > docs/pipeline-status.md
+          else
+            IFS='|' read -r PRICES IDX UNVERIFIED_F UNVERIFIED_CA FAILURES COMPANIES TXNS CONVICTIONS <<< "$ROW"
+
+            if [ "$PRICES" = "none" ]; then
+              AGE="n/a"
+            else
+              AGE=$(( ( $(date -d "$(TZ=Asia/Kolkata date +%F)" +%s) - $(date -d "$PRICES" +%s) ) / 86400 ))
+              AGE="${AGE} calendar days"
+            fi
+
+            {
+              echo "# Pipeline status"
+              echo
+              echo "_Generated $NOW by \`heartbeat.yml\`. Committed weekly; this file is"
+              echo "generated — edit the workflow, not the file._"
+              echo
+              echo "| Signal | Value |"
+              echo "|---|---|"
+              echo "| Latest price date | \`$PRICES\` (age: $AGE) |"
+              echo "| Latest index date | \`$IDX\` |"
+              echo "| Unverified fundamentals | $UNVERIFIED_F |"
+              echo "| Unverified corporate actions | $UNVERIFIED_CA |"
+              echo "| Open (unacknowledged) job failures | $FAILURES |"
+              echo "| Companies tracked | $COMPANIES |"
+              echo "| Conviction entries | $CONVICTIONS |"
+              echo "| Real transactions | $TXNS |"
+              echo
+              echo "Prices should normally be 1-4 calendar days old (NSE weekends and holidays)."
+              echo "A steadily growing age means the EOD job has stopped — check the Actions tab."
+            } > docs/pipeline-status.md
+          fi
+
+          cat docs/pipeline-status.md
+
+      - name: Commit status
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/pipeline-status.md
+          if git diff --staged --quiet; then
+            # Nothing changed. Rare (the generated-at line changes every run), but
+            # if it ever happens there is nothing to push and that is fine.
+            echo "No change to commit."
+          else
+            git commit -m "Pipeline status $(TZ=Asia/Kolkata date +%Y-%m-%d)"
+            git push
+          fi
+
+# This job does NOT write to job_failures on failure, on purpose: it is a
+# reporting job, and a failure here costs a week of margin on a 60-day window,
+# not data. Its own failure is visible in the Actions tab and, indirectly, as a
+# status file that stops updating.

@@ -64,12 +64,17 @@ export const useLatestPrices = () =>
     queryKey: ['latest_prices'],
     queryFn: async () => {
       // price_history has no "latest" flag; pull a recent window and reduce.
-      const since = new Date(Date.now() - 30 * 86_400_000).toISOString().slice(0, 10)
+      // 10 days is enough to find a prior close across a long weekend or holiday
+      // cluster, and keeps this well clear of PostgREST's 1000-row default cap
+      // (which truncates SILENTLY — oldest rows drop first, so a company would
+      // lose its `prev` and show "—" for 1d with no error).
+      const since = new Date(Date.now() - 10 * 86_400_000).toISOString().slice(0, 10)
       const { data, error } = await supabase
         .from('price_history')
         .select('isin, date, close')
         .gte('date', since)
         .order('date', { ascending: false })
+        .limit(1000)
       if (error) throw new Error(error.message)
       const latest = {}
       for (const row of data) {
@@ -81,11 +86,59 @@ export const useLatestPrices = () =>
     },
   })
 
+/**
+ * Latest NIFTY 50 close + prior close. The index is fetched by the same EOD job
+ * as prices but was never displayed — without it, "the market was down today" is
+ * indistinguishable from "my watchlist was down today".
+ */
+export const useIndexLatest = (indexName = 'NIFTY 50') =>
+  useQuery({
+    queryKey: ['index_latest', indexName],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from('index_history')
+        .select('index_name, date, close')
+        .eq('index_name', indexName)
+        .order('date', { ascending: false })
+        .limit(2)
+      if (error) throw new Error(error.message)
+      const [latest, prev] = data ?? []
+      return latest ? { ...latest, prev: prev?.close ?? null } : null
+    },
+  })
+
+/**
+ * Current TTM P/E per company.
+ *
+ * v_pe_current emits ONE ROW PER filing_type, so a company reporting both bases
+ * yields two materially different P/Es (live example: SUNPHARMA consolidated
+ * 37.7 vs standalone 153.4). The spec settled on consolidated-where-available
+ * (build spec §14), so that convention is applied here rather than letting the
+ * UI show whichever row happened to arrive first.
+ */
+export const usePE = () =>
+  useQuery({
+    queryKey: ['pe_current'],
+    queryFn: async () => {
+      const { data, error } = await supabase.from('v_pe_current').select('*')
+      if (error) throw new Error(`v_pe_current: ${error.message}`)
+      const byIsin = {}
+      for (const row of data ?? []) {
+        const held = byIsin[row.isin]
+        if (!held || (held.filing_type !== 'consolidated' && row.filing_type === 'consolidated')) {
+          byIsin[row.isin] = row
+        }
+      }
+      return byIsin
+    },
+  })
+
 export const usePortfolio = () =>
   useQuery({ queryKey: ['portfolio'], queryFn: from('v_portfolio_summary') })
 
-export const useConcentration = () =>
-  useQuery({ queryKey: ['concentration'], queryFn: from('v_concentration') })
+// NOTE: v_concentration exists in the DB but has no consumer while there are no
+// holdings — a hook here would be dead code on both tiers. Add it back alongside
+// the portfolio section when the first real position exists.
 
 export const useConvictions = (isin) =>
   useQuery({
@@ -112,6 +165,32 @@ export const usePrices = (isin) =>
     queryFn: from('v_price_adjusted', (q) =>
       q.eq('isin', isin).order('date', { ascending: false }).limit(120)),
   })
+
+/**
+ * Split/bonus-adjusted closes for a specific set of dates.
+ *
+ * Used to compute "how has this thesis done since I wrote it". conviction_log
+ * stores the RAW close at entry (an immutable record of the screen the user was
+ * looking at), but comparing a pre-split raw price against a post-split current
+ * price would report a fake collapse. Both sides of the comparison therefore come
+ * from v_price_adjusted instead.
+ */
+export const useAdjustedCloseAt = (isin, dates) => {
+  const key = [...new Set(dates ?? [])].sort()
+  return useQuery({
+    queryKey: ['adj_close_at', isin, key.join(',')],
+    enabled: Boolean(isin) && key.length > 0,
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from('v_price_adjusted')
+        .select('date, close_adjusted')
+        .eq('isin', isin)
+        .in('date', key)
+      if (error) throw new Error(error.message)
+      return Object.fromEntries((data ?? []).map((r) => [r.date, r.close_adjusted]))
+    },
+  })
+}
 
 export const useAddConviction = () => {
   const qc = useQueryClient()

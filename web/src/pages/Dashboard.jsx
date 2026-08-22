@@ -1,8 +1,9 @@
 import {
   useFreshness, useJobFailures, usePendingActions, useAcknowledgeFailures,
   useWatchlist, useLatestPrices, usePortfolio, useConvictions,
+  useIndexLatest, usePE,
 } from '../lib/queries.js'
-import { inr, num, daysSince } from '../lib/supabase.js'
+import { inr, num, daysSince, tradingDaysSince } from '../lib/supabase.js'
 
 export default function Dashboard({ onOpen, onReview }) {
   const freshness = useFreshness()
@@ -13,9 +14,13 @@ export default function Dashboard({ onOpen, onReview }) {
   const prices = useLatestPrices()
   const portfolio = usePortfolio()
   const convictions = useConvictions()
+  const nifty = useIndexLatest('NIFTY 50')
+  const pe = usePE()
 
   const asOf = freshness.data?.[0]?.prices_as_of
   const stale = daysSince(asOf)
+  // Weekend-aware, so a Friday close does not read as "stale" on Sunday.
+  const staleTrading = tradingDaysSince(asOf)
 
   return (
     <div className="space-y-6">
@@ -80,8 +85,11 @@ export default function Dashboard({ onOpen, onReview }) {
         </Banner>
       )}
 
-      {asOf && stale > 4 && (
-        <Banner tone="amber" title={`Prices are ${stale} days old`}>
+      {/* Counted in trading days, not calendar days: NSE holiday clusters made
+          the calendar-day version cry wolf every long weekend, and an alert that
+          is usually wrong is worse than no alert. */}
+      {asOf && staleTrading > 3 && (
+        <Banner tone="amber" title={`Prices are ${staleTrading} trading days old`}>
           <p className="mt-1 text-xs">
             Last close {asOf}. Check the EOD workflow before acting on anything here.
           </p>
@@ -95,6 +103,8 @@ export default function Dashboard({ onOpen, onReview }) {
           prices as of {asOf ?? '—'}
         </p>
       </div>
+
+      <MarketContext nifty={nifty} />
 
       <Portfolio query={portfolio} />
 
@@ -111,17 +121,30 @@ export default function Dashboard({ onOpen, onReview }) {
                   <th className="px-3 py-2 font-medium">Sector</th>
                   <th className="px-3 py-2 text-right font-medium">Close</th>
                   <th className="px-3 py-2 text-right font-medium">1d</th>
+                  <th className="px-3 py-2 text-right font-medium">P/E</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
                 {(watchlist.data ?? []).map((w) => {
                   const p = prices.data?.[w.isin]
                   const chg = p?.prev ? ((p.close - p.prev) / p.prev) * 100 : null
+                  const v = pe.data?.[w.isin]
                   return (
                     <tr
                       key={w.isin}
                       onClick={() => onOpen(w.isin)}
-                      className="cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-900/60"
+                      // Keyboard-reachable: this is the only navigation into a
+                      // company, and a bare <tr onClick> is mouse/touch-only.
+                      tabIndex={0}
+                      role="link"
+                      aria-label={`Open ${w.companies?.company_name ?? w.isin}`}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault()
+                          onOpen(w.isin)
+                        }
+                      }}
+                      className="cursor-pointer hover:bg-slate-50 focus:bg-slate-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-400 dark:hover:bg-slate-900/60 dark:focus:bg-slate-900/60"
                     >
                       <td className="px-3 py-2">
                         <div className="font-medium">{w.companies?.company_name}</div>
@@ -137,12 +160,40 @@ export default function Dashboard({ onOpen, onReview }) {
                         : 'text-rose-600 dark:text-rose-400'}`}>
                         {chg === null ? '—' : `${chg >= 0 ? '+' : ''}${num(chg, 2)}%`}
                       </td>
+                      <td className="px-3 py-2 text-right tnum">
+                        {v?.pe_current == null ? (
+                          <span className="text-slate-400">—</span>
+                        ) : (
+                          <span
+                            // An unverified quarter inside TTM EPS is surfaced,
+                            // never silently folded into the headline number.
+                            className={v.has_unverified ? 'text-amber-700 dark:text-amber-400' : ''}
+                            title={
+                              v.has_unverified
+                                ? 'Includes unconfirmed quarters — confirm in Review'
+                                : `${v.filing_type} · TTM EPS ${num(v.eps_ttm)}`
+                            }
+                          >
+                            {num(v.pe_current, 1)}
+                            {v.has_unverified && '*'}
+                          </span>
+                        )}
+                      </td>
                     </tr>
                   )
                 })}
               </tbody>
             </table>
           </div>
+          {Object.values(pe.data ?? {}).some((v) => v?.has_unverified) && (
+            <p className="mt-1.5 text-xs text-slate-500 dark:text-slate-400">
+              * P/E includes quarters that are still unconfirmed —{' '}
+              <button onClick={onReview} className="underline hover:text-slate-700 dark:hover:text-slate-200">
+                review them
+              </button>
+              .
+            </p>
+          )}
         </QueryState>
       </section>
 
@@ -168,6 +219,33 @@ export default function Dashboard({ onOpen, onReview }) {
         </QueryState>
       </section>
     </div>
+  )
+}
+
+/**
+ * NIFTY 50 close and 1d move.
+ *
+ * The EOD job has been storing this since day one and nothing ever showed it.
+ * Without an index reference, "ITC fell 2%" is unreadable — the user cannot tell
+ * a company-specific move from the whole market moving.
+ */
+function MarketContext({ nifty }) {
+  const d = nifty.data
+  if (!d) return null
+  const chg = d.prev ? ((Number(d.close) - Number(d.prev)) / Number(d.prev)) * 100 : null
+
+  return (
+    <section className="flex items-center gap-3 rounded-xl border border-slate-200 px-4 py-3 dark:border-slate-800">
+      <span className="text-xs text-slate-500 dark:text-slate-400">{d.index_name}</span>
+      <span className="text-sm font-semibold tnum">{num(d.close, 2)}</span>
+      {chg !== null && (
+        <span className={`text-xs font-medium tnum ${
+          chg >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
+          {chg >= 0 ? '+' : ''}{num(chg, 2)}%
+        </span>
+      )}
+      <span className="ml-auto text-xs text-slate-400 tnum">{d.date}</span>
+    </section>
   )
 }
 

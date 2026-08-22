@@ -62,3 +62,49 @@ export const daysSince = (d) => {
   const now = new Date()
   return Math.floor((now - then) / 86_400_000)
 }
+
+/**
+ * Today's date in Asia/Kolkata as YYYY-MM-DD.
+ *
+ * Needed because Postgres `DEFAULT current_date` evaluates in the SERVER's zone
+ * (Supabase runs UTC), so anything written between 00:00 and 05:30 IST would be
+ * stamped with the previous calendar day. A research journal that mis-dates
+ * late-night entries corrupts the one thing it exists to record.
+ */
+export const istToday = () =>
+  new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date())
+
+/**
+ * NSE trading days between a date and now, approximated by excluding weekends.
+ *
+ * Calendar days false-fire the staleness banner after any holiday cluster (last
+ * close Wednesday + Thu/Fri holidays + weekend = "5 days old" on Monday morning
+ * when nothing is wrong), and an alert that cries wolf is the failure mode this
+ * project treats as serious. Public holidays are NOT modelled (that would need a
+ * holiday table), so a two-day holiday cluster still inflates the count by two —
+ * the banner threshold sits above that so such a cluster cannot trip it alone.
+ * Weekends, the case that recurs every single week, are eliminated exactly.
+ */
+export const tradingDaysSince = (d) => {
+  if (!d) return null
+  // Anchor both ends at UTC NOON of the IST calendar date. Anchoring at IST
+  // midnight instead would put the instant at 18:30 UTC the previous day, so
+  // getUTCDay() would report the wrong weekday and count Saturdays as trading
+  // days — the exact off-by-one this comment exists to prevent.
+  const noonUTC = (iso) => new Date(`${iso}T12:00:00Z`)
+  const cursor = noonUTC(d)
+  const end = noonUTC(istToday())
+  let count = 0
+  cursor.setUTCDate(cursor.getUTCDate() + 1)
+  while (cursor <= end) {
+    const day = cursor.getUTCDay()
+    if (day !== 0 && day !== 6) count += 1
+    cursor.setUTCDate(cursor.getUTCDate() + 1)
+  }
+  return count
+}

@@ -71,7 +71,21 @@ Then add these repo secrets here (Settings → Secrets and variables → Actions
 |---|---|
 | `SUPABASE_DB_URL` | **Session pooler** connection string from step 1 (port 5432) |
 | `BACKUP_REPO` | `owner/name` of the backup repo |
-| `BACKUP_REPO_TOKEN` | PAT with `repo` scope on the backup repo |
+| `BACKUP_REPO_TOKEN` | **Fine-grained** PAT, scoped to the backup repo only, `Contents: Read and write` |
+
+> **Use a fine-grained PAT, not a classic one.** A classic PAT with `repo` scope
+> cannot be restricted to a single repository — it grants read/write on **every**
+> repo the account owns, including the public dashboard repo, where
+> `deploy-pages.yml` auto-deploys any push to `main`. If that token leaked, an
+> attacker could ship a modified frontend to the real Pages URL and harvest the
+> login, then read or destroy the whole database through the legitimate anon-key
+> API — and also read every historical dump in the private backup repo. A
+> fine-grained token scoped to `equity-research-backups` with only
+> `Contents: Read and write` removes all of that blast radius.
+>
+> Fine-grained PATs **expire** (max 1 year). Set a calendar reminder to rotate:
+> when it lapses the backup job starts failing, and although that now raises a
+> dashboard alert (see below), the alert only helps if you act on it.
 
 Run `.github/workflows/backup.yml` manually once (`workflow_dispatch`) and confirm a
 `dumps/db-YYYYMMDD.sql.gz` lands in the backup repo. Then verify it actually restores —
@@ -80,6 +94,27 @@ a backup you have never restored is not a backup:
 ```bash
 gunzip -c db-YYYYMMDD.sql.gz | psql "postgres://...localhost.../scratch_db"
 ```
+
+The backup job now writes a `job_failures` row when it fails, so a broken backup
+raises the dashboard banner instead of failing silently. It is deduped: one
+unacknowledged alert stands until you dismiss it, rather than a fresh row every
+night. The one case it cannot cover is the database itself being unreachable —
+a job cannot report a failure through the thing that is broken — but that case
+also stops the dashboard loading, so it is not silent either.
+
+### Keeping the schedules alive
+
+`.github/workflows/heartbeat.yml` runs weekly, publishes
+`docs/pipeline-status.md`, and commits it. In a **public** repository GitHub
+disables scheduled workflows after 60 days with no repository activity, and
+nothing else commits to *this* repo — the backup job pushes to the backups repo,
+which does not count. Without the heartbeat, every scheduled job stops about two
+months after your last hand-made commit.
+
+Treat it as prevention, not a guarantee: GitHub does not publicly define what
+counts as "repository activity". Detection is the price-staleness banner, which
+fires whenever data stops arriving for any reason. If GitHub emails you that
+scheduled workflows were disabled, re-enable them in the Actions tab.
 
 ## 4. Load price history
 

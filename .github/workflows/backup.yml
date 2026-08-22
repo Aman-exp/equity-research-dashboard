@@ -102,7 +102,43 @@ jobs:
             git push
           fi
 
-      # TODO (Phase 1): on failure, write a row into `job_failures` so the dashboard
-      # banner surfaces it. GitHub does NOT notify you when a scheduled workflow
-      # fails, so until that table and banner exist, this job failing is silent —
-      # check the Actions tab periodically in the meantime.
+      # ----------------------------------------------------------------------
+      # Failure alerting.
+      #
+      # This job is the single most important automation in the project, and it
+      # was the only one that failed SILENTLY: GitHub does not notify on failed
+      # scheduled workflows, and the dashboard banner is the project's only
+      # alerting mechanism (CLAUDE.md: "every job writes to job_failures on
+      # exception"). The likely failures are all slow-rot: BACKUP_REPO_TOKEN
+      # expiring, the DB password rotating, the backup repo being renamed, or
+      # branch protection appearing on its main. Any of those would stop backups
+      # of irreplaceable research every night, indefinitely, unnoticed.
+      #
+      # DEDUPED ON PURPOSE. This job runs nightly, so an unconditional INSERT
+      # would add a row every night and the banner would become noise the user
+      # learns to scroll past — the same failure mode the XBRL-404 path already
+      # guards against in fetch_fundamentals.py. One unacknowledged alert stands
+      # until dismissed; dismissing it re-arms the alert for the next failure.
+      # ----------------------------------------------------------------------
+      - name: Alert on failure
+        if: failure()
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -uo pipefail
+          docker run --rm postgres:17-alpine \
+            psql "$DB_URL" -X -v ON_ERROR_STOP=1 -c "
+              INSERT INTO job_failures (job_name, error_text)
+              SELECT 'nightly_backup',
+                     'Backup workflow failed — no new dump was committed. See GitHub Actions run ${{ github.run_id }}. Common causes: BACKUP_REPO_TOKEN expired, DB credentials rotated, backup repo renamed or branch-protected.'
+              WHERE NOT EXISTS (
+                SELECT 1 FROM job_failures
+                WHERE job_name = 'nightly_backup' AND acknowledged_at IS NULL
+              );
+            " \
+          || echo "::error::Backup failed AND the job_failures alert could not be written — the database itself is likely unreachable. Every scheduled job shares this credential, so assume all of them are failing."
+
+# Residual gap, stated plainly: if the DATABASE is what is unreachable, the alert
+# above cannot be written either — a failing job cannot report through the thing
+# that is broken. That case is not silent in practice, because the dashboard also
+# stops loading and the price-staleness banner fires as soon as it does load.

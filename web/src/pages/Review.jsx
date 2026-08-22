@@ -165,6 +165,7 @@ function CompanyFundamentals({ group }) {
       <header className="flex flex-wrap items-center gap-3 px-4 py-3">
         <button
           onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
           className="flex min-w-0 flex-1 items-center gap-2 text-left"
         >
           <span className="text-slate-400">{open ? '▾' : '▸'}</span>
@@ -180,13 +181,28 @@ function CompanyFundamentals({ group }) {
             </span>
           </span>
         </button>
-        <button
-          onClick={() => confirm.mutate(ids)}
-          disabled={confirm.isPending}
-          className="rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900"
-        >
-          {confirm.isPending ? 'Confirming…' : 'Confirm all'}
-        </button>
+        {/* Confirm-all appears only once the rows are on screen.
+            Previously this button rendered in the collapsed header, so 19
+            quarters — flagged ones included — could be confirmed without ever
+            being displayed. That makes `unverified` a decoration rather than a
+            control, and "confirmed" stops meaning anything. One extra click is
+            the whole cost. */}
+        {open ? (
+          <button
+            onClick={() => confirm.mutate(ids)}
+            disabled={confirm.isPending}
+            className="rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900"
+          >
+            {confirm.isPending ? 'Confirming…' : `Confirm all ${group.rows.length}`}
+          </button>
+        ) : (
+          <button
+            onClick={() => setOpen(true)}
+            className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-medium hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800"
+          >
+            Review{flagged > 0 ? ` (${flagged} flagged)` : ''}
+          </button>
+        )}
       </header>
 
       {open && (
