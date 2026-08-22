@@ -65,15 +65,52 @@ class NotPublished(Exception):
     """File absent — trading holiday, or not published yet. Not an error."""
 
 
-def fetch(url, retries=4):
-    """GET with exponential backoff. Raises NotPublished on 404."""
+class Throttled(Exception):
+    """
+    NSE answered, but with a web page instead of the file.
+
+    Observed 2026-08-22 on a GitHub Actions runner: a backfill issuing ~12
+    requests in 6 seconds got HTTP 200 with an HTML body where a zip was
+    expected, and zipfile raised BadZipFile mid-run. This is NSE's WAF throttling
+    a datacenter IP — the exact hazard the build spec flags as the most fragile
+    part of the system.
+
+    It is deliberately NOT folded into NotPublished. A holiday means "there is no
+    data and never will be", and is skipped silently; being throttled means "the
+    data exists and we failed to get it". Treating the second as the first would
+    silently punch holes in the price history — the kind of quiet data loss that
+    is far worse than a loud failure.
+    """
+
+
+def looks_like_html(blob):
+    head = blob[:512].lstrip()[:64].lower()
+    return head.startswith(b"<!doctype") or head.startswith(b"<html") or b"<head" in head
+
+
+def fetch(url, retries=4, expect_zip=False):
+    """
+    GET with exponential backoff.
+
+    Raises NotPublished on a real 404 (holiday / not yet published), and
+    Throttled when the response is an HTML page rather than the expected file —
+    after retrying, since throttling is usually transient.
+    """
     delay = 2
     last = None
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers=HEADERS)
             with urllib.request.urlopen(req, timeout=60) as r:
-                return r.read()
+                blob = r.read()
+            # A 200 is not proof of content. Validate what actually arrived:
+            # magic bytes for a zip, absence of an HTML shell otherwise.
+            if expect_zip and blob[:2] != b"PK":
+                last = Throttled(f"expected a zip, got {blob[:16]!r}")
+            elif looks_like_html(blob):
+                last = Throttled("server returned an HTML page")
+            else:
+                return blob
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 raise NotPublished(url)
@@ -82,7 +119,9 @@ def fetch(url, retries=4):
             last = e
         if attempt < retries - 1:
             time.sleep(delay)
-            delay *= 2
+            delay *= 2                              # 2s, 4s, 8s — lets a WAF cool off
+    if isinstance(last, Throttled):
+        raise Throttled(f"{url}: {last}")
     raise RuntimeError(f"failed after {retries} attempts: {url} ({last})")
 
 
@@ -234,17 +273,54 @@ def main():
             print("watchlist is empty — nothing to fetch")
             return
 
+        # RESUMABILITY. A multi-year backfill is ~640 requests; without this, any
+        # interruption means starting over and re-hammering NSE for data already
+        # stored. A date counts as done only when every active watchlist ISIN has
+        # a row, so a partially-ingested day is still re-fetched.
+        already_done = set()
+        if start != end:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT date FROM price_history
+                    WHERE isin = ANY(%s) AND date BETWEEN %s AND %s
+                    GROUP BY date HAVING count(DISTINCT isin) = %s
+                """, (list(wanted), start, end, len(wanted)))
+                already_done = {r[0] for r in cur.fetchall()}
+            if already_done:
+                print(f"resuming: {len(already_done)} day(s) in this range already complete")
+
         day, total_prices, total_idx, skipped = start, 0, 0, []
+        throttled_days, resumed = [], 0
+        # Backfills need a gentler pace than the single-day nightly run: NSE
+        # throttled a runner that issued ~12 requests in 6 seconds.
+        pause = 1 if start == end else 2.5
+
         while day <= end:
+            if day in already_done:
+                resumed += 1
+                day += timedelta(days=1)
+                continue
+
             stamp_p = day.strftime("%Y%m%d")
             stamp_i = day.strftime("%d%m%Y")
             try:
                 prices, symbols, catalogue = parse_bhavcopy(
-                    fetch(BHAVCOPY_URL.format(yyyymmdd=stamp_p)), wanted)
+                    fetch(BHAVCOPY_URL.format(yyyymmdd=stamp_p), expect_zip=True), wanted)
             except NotPublished:
                 # Holiday / weekend / not yet published. Normal, not an error.
                 skipped.append(day.isoformat())
                 day += timedelta(days=1)
+                continue
+            except Throttled as exc:
+                # The data exists and we could not get it. Record the date and
+                # KEEP GOING — one throttled day must not discard hundreds of
+                # successfully backfilled ones. Reported and alerted at the end
+                # so the gap is never silent, and re-running fills it because the
+                # resume check above skips what already landed.
+                print(f"  {day}: throttled — {exc}")
+                throttled_days.append(day.isoformat())
+                day += timedelta(days=1)
+                time.sleep(pause * 3)               # back off harder before continuing
                 continue
 
             try:
@@ -252,6 +328,14 @@ def main():
             except NotPublished:
                 indices = []
                 print(f"  {day}: bhavcopy present but index file missing")
+            except Throttled as exc:
+                # Prices for this day are in hand; losing the index alone is not
+                # worth discarding them. Recorded so the gap is visible, and a
+                # re-run refetches the day (it will not be "complete" without
+                # its prices anyway — but the index upsert is idempotent).
+                indices = []
+                print(f"  {day}: index file throttled — {exc}")
+                throttled_days.append(f"{day.isoformat()} (index only)")
 
             with conn.cursor() as cur:
                 psycopg2.extras.execute_batch(cur, """
@@ -295,11 +379,35 @@ def main():
                   + (f", {n_cat} securities catalogued" if n_cat else ""))
             day += timedelta(days=1)
             if day <= end:
-                time.sleep(1)          # be polite on backfill runs
+                time.sleep(pause)      # be polite; gentler still on backfills
 
         print(f"done: {total_prices} price rows, {total_idx} index rows")
+        if resumed:
+            print(f"skipped {resumed} day(s) already complete")
         if skipped:
-            print(f"no data (holiday/weekend/unpublished): {', '.join(skipped)}")
+            print(f"no data (holiday/weekend/unpublished): {len(skipped)} day(s)")
+
+        # A throttled day is a HOLE in the price history, not a holiday. Say so
+        # loudly, and make the alert actionable: re-running the same range costs
+        # almost nothing because completed days are skipped.
+        if throttled_days:
+            msg = (f"EOD backfill could not fetch {len(throttled_days)} day(s) — NSE "
+                   f"returned a web page instead of the file (WAF throttling). These "
+                   f"dates are MISSING from price history: "
+                   f"{', '.join(throttled_days[:20])}"
+                   f"{' …' if len(throttled_days) > 20 else ''}. "
+                   f"Re-run the same date range to fill them; days already stored are "
+                   f"skipped automatically.")
+            print(f"\nWARNING: {msg}")
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM job_failures WHERE job_name=%s AND error_text=%s",
+                    (JOB_NAME, msg))
+                if not cur.fetchone():
+                    cur.execute(
+                        "INSERT INTO job_failures (job_name, error_text) VALUES (%s,%s)",
+                        (JOB_NAME, msg))
+            conn.commit()
 
     except Exception as exc:                        # noqa: BLE001 - must always alert
         conn.rollback()
