@@ -311,13 +311,21 @@ def main():
                 skipped.append(day.isoformat())
                 day += timedelta(days=1)
                 continue
-            except Throttled as exc:
-                # The data exists and we could not get it. Record the date and
-                # KEEP GOING — one throttled day must not discard hundreds of
+            except (Throttled, RuntimeError) as exc:
+                # The data may exist and we could not get it. Record the date and
+                # KEEP GOING — one unreachable day must not discard hundreds of
                 # successfully backfilled ones. Reported and alerted at the end
                 # so the gap is never silent, and re-running fills it because the
                 # resume check above skips what already landed.
-                print(f"  {day}: throttled — {exc}")
+                #
+                # RuntimeError is caught alongside Throttled deliberately: it is
+                # what fetch() raises when the retries are exhausted for a
+                # non-404 reason (read timeout, connection reset). Observed
+                # 2026-08-22, when a 1h55m backfill died on its last leg because
+                # one request timed out — on 2025-09-13, a SATURDAY, a day with
+                # no data to lose. Both cases mean the same thing to this loop:
+                # note the gap, move on.
+                print(f"  {day}: unreachable — {exc}")
                 throttled_days.append(day.isoformat())
                 day += timedelta(days=1)
                 time.sleep(pause * 3)               # back off harder before continuing
@@ -328,13 +336,13 @@ def main():
             except NotPublished:
                 indices = []
                 print(f"  {day}: bhavcopy present but index file missing")
-            except Throttled as exc:
+            except (Throttled, RuntimeError) as exc:
                 # Prices for this day are in hand; losing the index alone is not
                 # worth discarding them. Recorded so the gap is visible, and a
                 # re-run refetches the day (it will not be "complete" without
                 # its prices anyway — but the index upsert is idempotent).
                 indices = []
-                print(f"  {day}: index file throttled — {exc}")
+                print(f"  {day}: index file unreachable — {exc}")
                 throttled_days.append(f"{day.isoformat()} (index only)")
 
             with conn.cursor() as cur:
@@ -387,12 +395,13 @@ def main():
         if skipped:
             print(f"no data (holiday/weekend/unpublished): {len(skipped)} day(s)")
 
-        # A throttled day is a HOLE in the price history, not a holiday. Say so
+        # An unreachable day is a HOLE in the price history, not a holiday. Say so
         # loudly, and make the alert actionable: re-running the same range costs
         # almost nothing because completed days are skipped.
         if throttled_days:
             msg = (f"EOD backfill could not fetch {len(throttled_days)} day(s) — NSE "
-                   f"returned a web page instead of the file (WAF throttling). These "
+                   f"returned a web page instead of the file (WAF throttling), or "
+                   f"the request timed out. These "
                    f"dates are MISSING from price history: "
                    f"{', '.join(throttled_days[:20])}"
                    f"{' …' if len(throttled_days) > 20 else ''}. "
