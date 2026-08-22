@@ -15,11 +15,30 @@ export const useFreshness = () =>
 export const useJobFailures = () =>
   useQuery({
     queryKey: ['job_failures'],
-    // Only recent failures matter — an old resolved one shouldn't nag forever.
+    // Recent AND unacknowledged. An alert you cannot clear — for something you
+    // cannot fix — teaches you to ignore the banner, which is the only alerting
+    // this project has.
     queryFn: from('job_failures', (q) =>
       q.gte('failed_at', new Date(Date.now() - 7 * 86_400_000).toISOString())
+       .is('acknowledged_at', null)
        .order('failed_at', { ascending: false })),
   })
+
+export const useAcknowledgeFailures = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (ids) => {
+      // Acknowledge, never delete — the row stays as history, it just stops
+      // shouting.
+      const { error } = await supabase
+        .from('job_failures')
+        .update({ acknowledged_at: new Date().toISOString() })
+        .in('id', ids)
+      if (error) throw new Error(error.message)
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['job_failures'] }),
+  })
+}
 
 export const usePendingActions = () =>
   useQuery({

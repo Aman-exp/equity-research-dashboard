@@ -1,5 +1,5 @@
 import {
-  useFreshness, useJobFailures, usePendingActions,
+  useFreshness, useJobFailures, usePendingActions, useAcknowledgeFailures,
   useWatchlist, useLatestPrices, usePortfolio, useConvictions,
 } from '../lib/queries.js'
 import { inr, num, daysSince } from '../lib/supabase.js'
@@ -7,6 +7,7 @@ import { inr, num, daysSince } from '../lib/supabase.js'
 export default function Dashboard({ onOpen, onReview }) {
   const freshness = useFreshness()
   const failures = useJobFailures()
+  const ack = useAcknowledgeFailures()
   const pending = usePendingActions()
   const watchlist = useWatchlist()
   const prices = useLatestPrices()
@@ -22,13 +23,32 @@ export default function Dashboard({ onOpen, onReview }) {
           corrupts everything below, so they precede the numbers. */}
       {failures.data?.length > 0 && (
         <Banner tone="red" title={`${failures.data.length} job failure(s) in the last 7 days`}>
-          <ul className="mt-1 space-y-1">
-            {failures.data.slice(0, 4).map((f) => (
-              <li key={f.id} className="text-xs">
-                <span className="font-mono">{f.job_name}</span> — {f.error_text}
+          <ul className="mt-1 space-y-2">
+            {failures.data.slice(0, 6).map((f) => (
+              <li key={f.id} className="flex items-start gap-2 text-xs">
+                <span className="min-w-0 flex-1">
+                  <span className="font-mono">{f.job_name}</span> — {f.error_text}
+                </span>
+                <button
+                  onClick={() => ack.mutate([f.id])}
+                  disabled={ack.isPending}
+                  title="Keeps the record, stops the alert"
+                  className="shrink-0 rounded border border-rose-300 px-2 py-0.5 text-[11px] hover:bg-rose-100 disabled:opacity-50 dark:border-rose-800 dark:hover:bg-rose-900/40"
+                >
+                  Dismiss
+                </button>
               </li>
             ))}
           </ul>
+          {failures.data.length > 1 && (
+            <button
+              onClick={() => ack.mutate(failures.data.map((f) => f.id))}
+              disabled={ack.isPending}
+              className="mt-2 rounded-lg bg-rose-900 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50 dark:bg-rose-200 dark:text-rose-950"
+            >
+              {ack.isPending ? 'Dismissing…' : `Dismiss all ${failures.data.length}`}
+            </button>
+          )}
         </Banner>
       )}
 
